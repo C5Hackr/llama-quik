@@ -1,602 +1,1009 @@
-# llama.cpp
+# llama-quik
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+**llama-quik** is an experimental high-performance fork/patchset for `llama.cpp` focused on making very large Mixture-of-Experts (MoE) GGUF models usable on limited-VRAM systems.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp)](https://github.com/ggml-org/llama.cpp/releases)
-[![Server](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+The core idea is simple:
 
-[Manifesto](https://github.com/ggml-org/llama.cpp/discussions/205) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md)
+> Keep the full routed MoE expert pool in CPU RAM, profile which experts are actually used, then promote hot experts into GPU VRAM so warmed decode can run faster without requiring the entire model to fit in VRAM.
 
-LLM inference in C/C++
+TLDR:
 
-## Recent API changes
+> Make huge MoE GGUF models usable and faster on hardware that cannot fit the full expert pool in VRAM.
 
-- [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)
-- [Changelog for `llama-server` REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+`llama-quik` is aimed at large MoE GGUF models where dense/shared weights and runtime buffers can use the GPU, while the much larger routed expert pool is paged, cached, or promoted dynamically.
 
-## Hot topics
+---
 
-- **Hugging Face cache migration: models downloaded with `-hf` are now stored in the standard Hugging Face cache directory, enabling sharing with other HF tools.**
-- **[guide : using the new WebUI of llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/16938)**
-- [guide : running gpt-oss with llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/15396)
-- [[FEEDBACK] Better packaging for llama.cpp to support downstream consumers 🤗](https://github.com/ggml-org/llama.cpp/discussions/15313)
-- Support for the `gpt-oss` model with native MXFP4 format has been added | [PR](https://github.com/ggml-org/llama.cpp/pull/15091) | [Collaboration with NVIDIA](https://blogs.nvidia.com/blog/rtx-ai-garage-openai-oss) | [Comment](https://github.com/ggml-org/llama.cpp/discussions/15095)
-- Multimodal support arrived in `llama-server`: [#12898](https://github.com/ggml-org/llama.cpp/pull/12898) | [documentation](./docs/multimodal.md)
-- VS Code extension for FIM completions: https://github.com/ggml-org/llama.vscode
-- Vim/Neovim plugin for FIM completions: https://github.com/ggml-org/llama.vim
-- Hugging Face Inference Endpoints now support GGUF out of the box! https://github.com/ggml-org/llama.cpp/discussions/9669
-- Hugging Face GGUF editor: [discussion](https://github.com/ggml-org/llama.cpp/discussions/9268) | [tool](https://huggingface.co/spaces/CISCai/gguf-editor)
-- WebGPU support is now available in the browser, see a blog/demo introducing it [here](https://reeselevine.github.io/llamas-on-the-web/).
+## Status
 
-----
+`llama-quik` is experimental.
 
-## Quick start
+Current backend status:
 
-Getting started with llama.cpp is straightforward. Here are several ways to install it on your machine:
+* CPU-MoE fallback works.
+* MoE expert routing profiler works.
+* GPU VRAM cache allocation works.
+* Whole-layer expert promotion works.
+* Hard backend per-expert GPU slot cache works for decode.
+* CUDA graph capture is bypassed for dynamic expert promotion.
+* Prompt/batch phase uses a safe fallback path.
+* Warmed decode uses the GPU expert slot cache where available.
+* Normal llama.cpp multi-GPU tensor split can still be used.
+* The expert-slot cache is currently centered on the main CUDA device, not fully distributed across all GPUs.
 
-- Install `llama.cpp` using [brew, nix, winget, or conda-forge](docs/install.md)
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+In short:
 
-Once installed, you'll need a model to work with. Head to the [Obtaining and quantizing models](#obtaining-and-quantizing-models) section to learn more.
+```text
+Supported today:
+  multi-GPU model compute via llama.cpp
+  single-main-GPU expert slot cache via llama-quik
 
-Example command:
-
-```sh
-# Use a local model file
-llama-cli -m my_model.gguf
-
-# Or download and run a model directly from Hugging Face
-llama-cli -hf ggml-org/gemma-3-1b-it-GGUF
-
-# Launch OpenAI-compatible API server
-llama-server -hf ggml-org/gemma-3-1b-it-GGUF
+Not fully implemented yet:
+  distributed expert slot caches across every GPU
+  mixed CPU/GPU expert execution inside the same layer for arbitrary batch shapes
+  fully async multi-device expert promotion/eviction
 ```
 
-## Description
+---
 
-The main goal of `llama.cpp` is to enable LLM inference with minimal setup and state-of-the-art performance on a wide
-range of hardware - locally and in the cloud.
+## Why llama-quik exists
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+Large MoE models are different from dense models.
 
-The `llama.cpp` project is the main playground for developing new features for the [ggml](https://github.com/ggml-org/ggml) library.
+A dense model needs most of its weights available every token. An MoE model has many experts, but only a subset are routed for each token. That creates an opportunity:
 
-<details>
-<summary>Models</summary>
+```text
+Dense model:
+  every layer uses its full weights every token
 
-Typically finetunes of the base models below are supported as well.
-
-Instructions for adding support for new models: [HOWTO-add-model.md](docs/development/HOWTO-add-model.md)
-
-#### Text-only
-
-- [X] LLaMA 🦙
-- [x] LLaMA 2 🦙🦙
-- [x] LLaMA 3 🦙🦙🦙
-- [X] [Mistral 7B](https://huggingface.co/mistralai/Mistral-7B-v0.1)
-- [x] [Mixtral MoE](https://huggingface.co/models?search=mistral-ai/Mixtral)
-- [x] [DBRX](https://huggingface.co/databricks/dbrx-instruct)
-- [x] [Jamba](https://huggingface.co/ai21labs)
-- [X] [Falcon](https://huggingface.co/models?search=tiiuae/falcon)
-- [X] [Chinese LLaMA / Alpaca](https://github.com/ymcui/Chinese-LLaMA-Alpaca) and [Chinese LLaMA-2 / Alpaca-2](https://github.com/ymcui/Chinese-LLaMA-Alpaca-2)
-- [X] [Vigogne (French)](https://github.com/bofenghuang/vigogne)
-- [X] [BERT](https://github.com/ggml-org/llama.cpp/pull/5423)
-- [X] [Koala](https://bair.berkeley.edu/blog/2023/04/03/koala/)
-- [X] [Baichuan 1 & 2](https://huggingface.co/models?search=baichuan-inc/Baichuan) + [derivations](https://huggingface.co/hiyouga/baichuan-7b-sft)
-- [X] [Aquila 1 & 2](https://huggingface.co/models?search=BAAI/Aquila)
-- [X] [Starcoder models](https://github.com/ggml-org/llama.cpp/pull/3187)
-- [X] [Refact](https://huggingface.co/smallcloudai/Refact-1_6B-fim)
-- [X] [MPT](https://github.com/ggml-org/llama.cpp/pull/3417)
-- [X] [Bloom](https://github.com/ggml-org/llama.cpp/pull/3553)
-- [x] [Yi models](https://huggingface.co/models?search=01-ai/Yi)
-- [X] [StableLM models](https://huggingface.co/stabilityai)
-- [x] [Deepseek models](https://huggingface.co/models?search=deepseek-ai/deepseek)
-- [x] [Qwen models](https://huggingface.co/models?search=Qwen/Qwen)
-- [x] [PLaMo-13B](https://github.com/ggml-org/llama.cpp/pull/3557)
-- [x] [Phi models](https://huggingface.co/models?search=microsoft/phi)
-- [x] [PhiMoE](https://github.com/ggml-org/llama.cpp/pull/11003)
-- [x] [GPT-2](https://huggingface.co/gpt2)
-- [x] [Orion 14B](https://github.com/ggml-org/llama.cpp/pull/5118)
-- [x] [InternLM2](https://huggingface.co/models?search=internlm2)
-- [x] [CodeShell](https://github.com/WisdomShell/codeshell)
-- [x] [Gemma](https://ai.google.dev/gemma)
-- [x] [Mamba](https://github.com/state-spaces/mamba)
-- [x] [Grok-1](https://huggingface.co/keyfan/grok-1-hf)
-- [x] [Xverse](https://huggingface.co/models?search=xverse)
-- [x] [Command-R models](https://huggingface.co/models?search=CohereForAI/c4ai-command-r)
-- [x] [SEA-LION](https://huggingface.co/models?search=sea-lion)
-- [x] [GritLM-7B](https://huggingface.co/GritLM/GritLM-7B) + [GritLM-8x7B](https://huggingface.co/GritLM/GritLM-8x7B)
-- [x] [OLMo](https://allenai.org/olmo)
-- [x] [OLMo 2](https://allenai.org/olmo)
-- [x] [OLMoE](https://huggingface.co/allenai/OLMoE-1B-7B-0924)
-- [x] [Granite models](https://huggingface.co/collections/ibm-granite/granite-code-models-6624c5cec322e4c148c8b330)
-- [x] [GPT-NeoX](https://github.com/EleutherAI/gpt-neox) + [Pythia](https://github.com/EleutherAI/pythia)
-- [x] [Snowflake-Arctic MoE](https://huggingface.co/collections/Snowflake/arctic-66290090abe542894a5ac520)
-- [x] [Smaug](https://huggingface.co/models?search=Smaug)
-- [x] [Poro 34B](https://huggingface.co/LumiOpen/Poro-34B)
-- [x] [Bitnet b1.58 models](https://huggingface.co/1bitLLM)
-- [x] [Flan T5](https://huggingface.co/models?search=flan-t5)
-- [x] [Open Elm models](https://huggingface.co/collections/apple/openelm-instruct-models-6619ad295d7ae9f868b759ca)
-- [x] [ChatGLM3-6b](https://huggingface.co/THUDM/chatglm3-6b) + [ChatGLM4-9b](https://huggingface.co/THUDM/glm-4-9b) + [GLMEdge-1.5b](https://huggingface.co/THUDM/glm-edge-1.5b-chat) + [GLMEdge-4b](https://huggingface.co/THUDM/glm-edge-4b-chat)
-- [x] [GLM-4-0414](https://huggingface.co/collections/THUDM/glm-4-0414-67f3cbcb34dd9d252707cb2e)
-- [x] [SmolLM](https://huggingface.co/collections/HuggingFaceTB/smollm-6695016cad7167254ce15966)
-- [x] [EXAONE-3.0-7.8B-Instruct](https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct)
-- [x] [FalconMamba Models](https://huggingface.co/collections/tiiuae/falconmamba-7b-66b9a580324dd1598b0f6d4a)
-- [x] [Jais](https://huggingface.co/inceptionai/jais-13b-chat)
-- [x] [Bielik-11B-v2.3](https://huggingface.co/collections/speakleash/bielik-11b-v23-66ee813238d9b526a072408a)
-- [x] [RWKV-7](https://huggingface.co/collections/shoumenchougou/rwkv7-gxx-gguf)
-- [x] [RWKV-6](https://github.com/BlinkDL/RWKV-LM)
-- [x] [QRWKV-6](https://huggingface.co/recursal/QRWKV6-32B-Instruct-Preview-v0.1)
-- [x] [GigaChat-20B-A3B](https://huggingface.co/ai-sage/GigaChat-20B-A3B-instruct)
-- [X] [Trillion-7B-preview](https://huggingface.co/trillionlabs/Trillion-7B-preview)
-- [x] [Ling models](https://huggingface.co/collections/inclusionAI/ling-67c51c85b34a7ea0aba94c32)
-- [x] [LFM2 models](https://huggingface.co/collections/LiquidAI/lfm2-686d721927015b2ad73eaa38)
-- [x] [Hunyuan models](https://huggingface.co/collections/tencent/hunyuan-dense-model-6890632cda26b19119c9c5e7)
-- [x] [BailingMoeV2 (Ring/Ling 2.0) models](https://huggingface.co/collections/inclusionAI/ling-v2-68bf1dd2fc34c306c1fa6f86)
-- [x] [Mellum models](https://huggingface.co/JetBrains/models?search=mellum)
-
-#### Multimodal
-
-- [x] [LLaVA 1.5 models](https://huggingface.co/collections/liuhaotian/llava-15-653aac15d994e992e2677a7e), [LLaVA 1.6 models](https://huggingface.co/collections/liuhaotian/llava-16-65b9e40155f60fd046a5ccf2)
-- [x] [BakLLaVA](https://huggingface.co/models?search=SkunkworksAI/Bakllava)
-- [x] [Obsidian](https://huggingface.co/NousResearch/Obsidian-3B-V0.5)
-- [x] [ShareGPT4V](https://huggingface.co/models?search=Lin-Chen/ShareGPT4V)
-- [x] [MobileVLM 1.7B/3B models](https://huggingface.co/models?search=mobileVLM)
-- [x] [Yi-VL](https://huggingface.co/models?search=Yi-VL)
-- [x] [Mini CPM](https://huggingface.co/models?search=MiniCPM)
-- [x] [Moondream](https://huggingface.co/vikhyatk/moondream2)
-- [x] [Bunny](https://github.com/BAAI-DCAI/Bunny)
-- [x] [GLM-EDGE](https://huggingface.co/models?search=glm-edge)
-- [x] [Qwen2-VL](https://huggingface.co/collections/Qwen/qwen2-vl-66cee7455501d7126940800d)
-- [x] [LFM2-VL](https://huggingface.co/collections/LiquidAI/lfm2-vl-68963bbc84a610f7638d5ffa)
-
-</details>
-
-<details>
-<summary>Bindings</summary>
-
-- Python: [ddh0/easy-llama](https://github.com/ddh0/easy-llama)
-- Python: [abetlen/llama-cpp-python](https://github.com/abetlen/llama-cpp-python)
-- Go: [go-skynet/go-llama.cpp](https://github.com/go-skynet/go-llama.cpp)
-- Node.js: [withcatai/node-llama-cpp](https://github.com/withcatai/node-llama-cpp)
-- JS/TS (llama.cpp server client): [lgrammel/modelfusion](https://modelfusion.dev/integration/model-provider/llamacpp)
-- JS/TS (Programmable Prompt Engine CLI): [offline-ai/cli](https://github.com/offline-ai/cli)
-- JavaScript/Wasm (works in browser): [tangledgroup/llama-cpp-wasm](https://github.com/tangledgroup/llama-cpp-wasm)
-- Typescript/Wasm (nicer API, available on npm): [ngxson/wllama](https://github.com/ngxson/wllama)
-- Ruby: [yoshoku/llama_cpp.rb](https://github.com/yoshoku/llama_cpp.rb)
-- Ruby: [docusealco/rllama](https://github.com/docusealco/rllama)
-- Rust (more features): [edgenai/llama_cpp-rs](https://github.com/edgenai/llama_cpp-rs)
-- Rust (nicer API): [mdrokz/rust-llama.cpp](https://github.com/mdrokz/rust-llama.cpp)
-- Rust (more direct bindings): [utilityai/llama-cpp-rs](https://github.com/utilityai/llama-cpp-rs)
-- Rust (automated build from crates.io): [ShelbyJenkins/llm_client](https://github.com/ShelbyJenkins/llm_client)
-- C#/.NET: [SciSharp/LLamaSharp](https://github.com/SciSharp/LLamaSharp)
-- C#/VB.NET (more features - community license): [LM-Kit.NET](https://docs.lm-kit.com/lm-kit-net/index.html)
-- Scala 3: [donderom/llm4s](https://github.com/donderom/llm4s)
-- Clojure: [phronmophobic/llama.clj](https://github.com/phronmophobic/llama.clj)
-- React Native: [mybigday/llama.rn](https://github.com/mybigday/llama.rn)
-- Java: [kherud/java-llama.cpp](https://github.com/kherud/java-llama.cpp)
-- Java: [QuasarByte/llama-cpp-jna](https://github.com/QuasarByte/llama-cpp-jna)
-- Zig: [deins/llama.cpp.zig](https://github.com/Deins/llama.cpp.zig)
-- Flutter/Dart: [netdur/llama_cpp_dart](https://github.com/netdur/llama_cpp_dart)
-- Flutter: [xuegao-tzx/Fllama](https://github.com/xuegao-tzx/Fllama)
-- PHP (API bindings and features built on top of llama.cpp): [distantmagic/resonance](https://github.com/distantmagic/resonance) [(more info)](https://github.com/ggml-org/llama.cpp/pull/6326)
-- Guile Scheme: [guile_llama_cpp](https://savannah.nongnu.org/projects/guile-llama-cpp)
-- Swift [srgtuszy/llama-cpp-swift](https://github.com/srgtuszy/llama-cpp-swift)
-- Swift [ShenghaiWang/SwiftLlama](https://github.com/ShenghaiWang/SwiftLlama)
-- Delphi [Embarcadero/llama-cpp-delphi](https://github.com/Embarcadero/llama-cpp-delphi)
-- Go (no CGo needed): [hybridgroup/yzma](https://github.com/hybridgroup/yzma)
-- Android: [llama.android](/examples/llama.android)
-
-</details>
-
-<details>
-<summary>UIs</summary>
-
-*(to have a project listed here, it should clearly state that it depends on `llama.cpp`)*
-
-- [AI Sublime Text plugin](https://github.com/yaroslavyaroslav/OpenAI-sublime-text) (MIT)
-- [BonzAI App](https://apps.apple.com/us/app/bonzai-your-local-ai-agent/id6752847988) (proprietary)
-- [cztomsik/ava](https://github.com/cztomsik/ava) (MIT)
-- [Dot](https://github.com/alexpinel/Dot) (GPL)
-- [eva](https://github.com/ylsdamxssjxxdd/eva) (MIT)
-- [iohub/collama](https://github.com/iohub/coLLaMA) (Apache-2.0)
-- [janhq/jan](https://github.com/janhq/jan) (AGPL)
-- [johnbean393/Sidekick](https://github.com/johnbean393/Sidekick) (MIT)
-- [KanTV](https://github.com/zhouwg/kantv?tab=readme-ov-file) (Apache-2.0)
-- [KodiBot](https://github.com/firatkiral/kodibot) (GPL)
-- [llama.vim](https://github.com/ggml-org/llama.vim) (MIT)
-- [LARS](https://github.com/abgulati/LARS) (AGPL)
-- [Llama Assistant](https://github.com/vietanhdev/llama-assistant) (GPL)
-- [LlamaLib](https://github.com/undreamai/LlamaLib) (Apache-2.0)
-- [LLMFarm](https://github.com/guinmoon/LLMFarm?tab=readme-ov-file) (MIT)
-- [LLMUnity](https://github.com/undreamai/LLMUnity) (MIT)
-- [LMStudio](https://lmstudio.ai/) (proprietary)
-- [LocalAI](https://github.com/mudler/LocalAI) (MIT)
-- [LostRuins/koboldcpp](https://github.com/LostRuins/koboldcpp) (AGPL)
-- [MindMac](https://mindmac.app) (proprietary)
-- [MindWorkAI/AI-Studio](https://github.com/MindWorkAI/AI-Studio) (FSL-1.1-MIT)
-- [Mobile-Artificial-Intelligence/maid](https://github.com/Mobile-Artificial-Intelligence/maid) (MIT)
-- [Mozilla-Ocho/llamafile](https://github.com/Mozilla-Ocho/llamafile) (Apache-2.0)
-- [nat/openplayground](https://github.com/nat/openplayground) (MIT)
-- [nomic-ai/gpt4all](https://github.com/nomic-ai/gpt4all) (MIT)
-- [ollama/ollama](https://github.com/ollama/ollama) (MIT)
-- [oobabooga/text-generation-webui](https://github.com/oobabooga/text-generation-webui) (AGPL)
-- [PocketPal AI](https://github.com/a-ghorbani/pocketpal-ai) (MIT)
-- [psugihara/FreeChat](https://github.com/psugihara/FreeChat) (MIT)
-- [ptsochantaris/emeltal](https://github.com/ptsochantaris/emeltal) (MIT)
-- [pythops/tenere](https://github.com/pythops/tenere) (AGPL)
-- [ramalama](https://github.com/containers/ramalama) (MIT)
-- [semperai/amica](https://github.com/semperai/amica) (MIT)
-- [withcatai/catai](https://github.com/withcatai/catai) (MIT)
-- [Autopen](https://github.com/blackhole89/autopen) (GPL)
-
-</details>
-
-<details>
-<summary>Tools</summary>
-
-- [akx/ggify](https://github.com/akx/ggify) – download PyTorch models from Hugging Face Hub and convert them to GGML
-- [akx/ollama-dl](https://github.com/akx/ollama-dl) – download models from the Ollama library to be used directly with llama.cpp
-- [crashr/gppm](https://github.com/crashr/gppm) – launch llama.cpp instances utilizing NVIDIA Tesla P40 or P100 GPUs with reduced idle power consumption
-- [gpustack/gguf-parser](https://github.com/gpustack/gguf-parser-go/tree/main/cmd/gguf-parser) - review/check the GGUF file and estimate the memory usage
-- [Styled Lines](https://marketplace.unity.com/packages/tools/generative-ai/styled-lines-llama-cpp-model-292902) (proprietary licensed, async wrapper of inference part for game development in Unity3d with pre-built Mobile and Web platform wrappers and a model example)
-- [unslothai/unsloth](https://github.com/unslothai/unsloth) – 🦥 exports/saves fine-tuned and trained models to GGUF (Apache-2.0)
-
-</details>
-
-<details>
-<summary>Infrastructure</summary>
-
-- [Paddler](https://github.com/intentee/paddler) - Open-source LLMOps platform for hosting and scaling AI in your own infrastructure
-- [GPUStack](https://github.com/gpustack/gpustack) - Manage GPU clusters for running LLMs
-- [llama_cpp_canister](https://github.com/onicai/llama_cpp_canister) - llama.cpp as a smart contract on the Internet Computer, using WebAssembly
-- [llama-swap](https://github.com/mostlygeek/llama-swap) - transparent proxy that adds automatic model switching with llama-server
-- [Kalavai](https://github.com/kalavai-net/kalavai-client) - Crowdsource end to end LLM deployment at any scale
-- [llmaz](https://github.com/InftyAI/llmaz) - ☸️ Easy, advanced inference platform for large language models on Kubernetes.
-- [LLMKube](https://github.com/defilantech/llmkube) - Kubernetes operator for llama.cpp with multi-GPU and Apple Silicon Metal
-  support"
-</details>
-
-<details>
-<summary>Games</summary>
-
-- [Lucy's Labyrinth](https://github.com/MorganRO8/Lucys_Labyrinth) - A simple maze game where agents controlled by an AI model will try to trick you.
-
-</details>
-
-
-## Supported backends
-
-| Backend | Target devices |
-| --- | --- |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-
-## Obtaining and quantizing models
-
-The [Hugging Face](https://huggingface.co) platform hosts a [number of LLMs](https://huggingface.co/models?library=gguf&sort=trending) compatible with `llama.cpp`:
-
-- [Trending](https://huggingface.co/models?library=gguf&sort=trending)
-- [LLaMA](https://huggingface.co/models?sort=trending&search=llama+gguf)
-
-You can either manually download the GGUF file or directly use any `llama.cpp`-compatible models from [Hugging Face](https://huggingface.co/) or other model hosting sites, by using this CLI argument: `-hf <user>/<model>[:quant]`. For example:
-
-```sh
-llama-cli -hf ggml-org/gemma-3-1b-it-GGUF
+MoE model:
+  router selects a small set of experts per token
+  many experts are cold or rarely used
 ```
 
-By default, the CLI would download from Hugging Face, you can switch to other options with the environment variable `MODEL_ENDPOINT`. The `MODEL_ENDPOINT` must point to a Hugging Face compatible API endpoint.
+`llama-quik` exploits that by profiling routing behavior and using GPU VRAM for the hot expert paths instead of trying to fit the entire expert pool on the GPU.
 
-After downloading a model, use the CLI tools to run it locally - see below.
+---
 
-`llama.cpp` requires the model to be stored in the [GGUF](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) file format. Models in other data formats can be converted to GGUF using the `convert_*.py` Python scripts in this repo.
+## How it works
 
-The Hugging Face platform provides a variety of online tools for converting, quantizing and hosting models with `llama.cpp`:
+When `--moe-expert-pager` is enabled, `llama-quik`:
 
-- Use the [GGUF-my-repo space](https://huggingface.co/spaces/ggml-org/gguf-my-repo) to convert to GGUF format and quantize model weights to smaller sizes
-- Use the [GGUF-my-LoRA space](https://huggingface.co/spaces/ggml-org/gguf-my-lora) to convert LoRA adapters to GGUF format (more info: https://github.com/ggml-org/llama.cpp/discussions/10123)
-- Use the [GGUF-editor space](https://huggingface.co/spaces/CISCai/gguf-editor) to edit GGUF meta data in the browser (more info: https://github.com/ggml-org/llama.cpp/discussions/9268)
-- Use the [Inference Endpoints](https://ui.endpoints.huggingface.co/) to directly host `llama.cpp` in the cloud (more info: https://github.com/ggml-org/llama.cpp/discussions/9669)
+1. Loads routed MoE expert tensors in CPU memory.
+2. Keeps normal dense/shared model parts on GPU when llama.cpp can offload them.
+3. Profiles which experts are selected during real prompts.
+4. Allocates GPU expert slot cache memory.
+5. JIT-promotes selected experts from CPU RAM into GPU VRAM slots.
+6. Uses the GPU slot cache during decode.
+7. Falls back safely when the cache path is not ready or not appropriate.
 
-To learn more about model quantization, [read this documentation](tools/quantize/README.md)
+Conceptually:
 
-## [`llama-cli`](tools/cli)
+```text
+CPU RAM:
+  full routed expert pool
 
-#### A CLI tool for accessing and experimenting with most of `llama.cpp`'s functionality.
+GPU VRAM:
+  dense/shared compute
+  KV/runtime buffers
+  hot expert slot cache
 
-- <details open>
-    <summary>Run in conversation mode</summary>
+Runtime:
+  selected expert ID -> GPU slot ID
+```
 
-    Models with a built-in chat template will automatically activate conversation mode. If this doesn't occur, you can manually enable it by adding `-cnv` and specifying a suitable chat template with `--chat-template NAME`
+---
 
-    ```bash
-    llama-cli -m model.gguf
+## Requirements
 
-    # > hi, who are you?
-    # Hi there! I'm your helpful assistant! I'm an AI-powered chatbot designed to assist and provide information to users like you. I'm here to help answer your questions, provide guidance, and offer support on a wide range of topics. I'm a friendly and knowledgeable AI, and I'm always happy to help with anything you need. What's on your mind, and how can I assist you today?
-    #
-    # > what is 1+1?
-    # Easy peasy! The answer to 1+1 is... 2!
-    ```
+`llama-quik` reduces VRAM pressure, not total memory requirements.
 
-    </details>
+The full model still needs to fit in system RAM.
 
-- <details>
-    <summary>Run in conversation mode with custom chat template</summary>
+`llama-quik` is most useful when:
 
-    ```bash
-    # use the "chatml" template (use -h to see the list of supported templates)
-    llama-cli -m model.gguf -cnv --chat-template chatml
+```text
+System RAM:
+  large enough to hold the full GGUF model and runtime memory
 
-    # use a custom template
-    llama-cli -m model.gguf -cnv --in-prefix 'User: ' --reverse-prompt 'User:'
-    ```
+GPU VRAM:
+  not large enough to hold the full model
+  but large enough to cache hot experts and run dense/shared compute
+```
 
-    </details>
+Using `--no-mmap` can improve speed on some systems because model data is loaded into RAM instead of relying on demand paging from disk. However, `--no-mmap` also increases the importance of having enough available system RAM.
 
-- <details>
-    <summary>Constrain the output with a custom grammar</summary>
+---
 
-    ```bash
-    llama-cli -m model.gguf -n 256 --grammar-file grammars/json.gbnf -p 'Request: schedule a call at 8pm; Command:'
+## Features
 
-    # {"appointmentTime": "8pm", "appointmentDetails": "schedule a a call"}
-    ```
+### MoE expert pager
 
-    The [grammars/](grammars/) folder contains a handful of sample grammars. To write your own, check out the [GBNF Guide](grammars/README.md).
+Enable with:
 
-    For authoring more complex JSON grammars, check out https://grammar.intrinsiclabs.ai/
+```bash
+--moe-expert-pager
+```
 
-    </details>
+This turns on the MoE expert pager system.
 
+---
 
-## [`llama-server`](tools/server)
+### Hard backend per-expert GPU slot cache
 
-#### A lightweight, [OpenAI API](https://github.com/openai/openai-openapi) compatible, HTTP server for serving LLMs.
+The hard backend is the current recommended backend.
 
-- <details open>
-    <summary>Start a local HTTP server with default configuration on port 8080</summary>
+It allocates compact GPU slot banks for selected expert tensors. Instead of copying whole MoE layers, it promotes individual selected experts into GPU slots.
 
-    ```bash
-    llama-server -m model.gguf --port 8080
+This is more VRAM-efficient than whole-layer caching.
 
-    # Basic web UI can be accessed via browser: http://localhost:8080
-    # Chat completion endpoint: http://localhost:8080/v1/chat/completions
-    ```
+---
 
-    </details>
+### Whole-layer fallback cache
 
-- <details>
-    <summary>Support multiple-users and parallel decoding</summary>
+A previous backend promoted complete hot MoE layers into GPU VRAM.
 
-    ```bash
-    # up to 4 concurrent requests, each with 4096 max context
-    llama-server -m model.gguf -c 16384 -np 4
-    ```
+That path is still useful as a fallback or debugging mode because it is simpler and more conservative.
 
-    </details>
+Use:
 
-- <details>
-    <summary>Enable speculative decoding</summary>
+```bash
+--moe-expert-whole-layer-cache
+```
 
-    ```bash
-    # the draft.gguf model should be a small variant of the target model.gguf
-    llama-server -m model.gguf -md draft.gguf
-    ```
+Current recommended default is the hard backend, not whole-layer mode.
 
-    </details>
+---
 
-- <details>
-    <summary>Serve an embedding model</summary>
+### Auto-tuned server defaults
 
-    ```bash
-    # use the /embedding endpoint
-    llama-server -m model.gguf --embedding --pooling cls -ub 8192
-    ```
+When `--moe-expert-pager` is enabled, `llama-quik` automatically applies several performance-oriented defaults:
 
-    </details>
+```text
+--no-mmap
+--flash-attn on
+--cache-ram 0
+--ctx-checkpoints 0
+--cache-type-k q8_0
+--cache-type-v q8_0
+-np 1
+```
 
-- <details>
-    <summary>Serve a reranking model</summary>
+These defaults are chosen for single-user raw token/sec performance on large MoE models.
 
-    ```bash
-    # use the /reranking endpoint
-    llama-server -m model.gguf --reranking
-    ```
+Disable automatic tuning with:
 
-    </details>
+```bash
+--moe-expert-pager-no-auto-tune
+```
 
-- <details>
-    <summary>Constrain all outputs with a grammar</summary>
+---
 
-    ```bash
-    # custom grammar
-    llama-server -m model.gguf --grammar-file grammar.gbnf
+## Build
 
-    # JSON
-    llama-server -m model.gguf --grammar-file grammars/json.gbnf
-    ```
+### Windows CUDA build
 
-    </details>
+```cmd
+cmake -B build -G "Visual Studio 17 2022" -A x64 -DGGML_CUDA=ON
+cmake --build build --config Release --target llama-server -j 8
+```
 
+Verify the new flags exist:
 
-## [`llama-perplexity`](tools/perplexity)
+```cmd
+build\bin\Release\llama-server.exe --help | findstr moe
+```
 
-#### A tool for measuring the [perplexity](tools/perplexity/README.md) [^1] (and other quality metrics) of a model over a given text.
+---
 
-- <details open>
-    <summary>Measure the perplexity over a text file</summary>
+### Linux CUDA build
 
-    ```bash
-    llama-perplexity -m model.gguf -f file.txt
+```bash
+cmake -B build \
+  -DGGML_CUDA=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=native
+
+cmake --build build --target llama-server -j 8
+```
+
+For older Pascal GPUs, use the appropriate CUDA architecture explicitly. For example:
+
+```bash
+cmake -B build \
+  -DGGML_CUDA=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=60
+
+cmake --build build --target llama-server -j 8
+```
+
+Older Pascal GPUs should generally use CUDA 12.x. CUDA 13.x may not support them properly.
+
+---
+
+## Basic usage
+
+Example using a large GGUF MoE model:
+
+```bash
+./llama-server \
+  -m /path/to/model.gguf \
+  -c 2048 \
+  -ngl 999 \
+  --moe-expert-pager \
+  --host 127.0.0.1 \
+  --port 8080
+```
+
+Log/debug mode:
+
+```bash
+./llama-server \
+  -m /path/to/model.gguf \
+  -c 2048 \
+  -ngl 999 \
+  --moe-expert-pager \
+  --moe-expert-log \
+  --host 127.0.0.1 \
+  --port 8080
+```
+
+The backend is active when the logs show:
+
+```text
+backend=gpu-expert-slot-cache-active(jit-promote-cpu-to-gpu)
+```
+
+---
+
+## Recommended commands
+
+### General benchmark command
+
+```bash
+./llama-server \
+  -m /path/to/model.gguf \
+  -c 2048 \
+  -ngl 999 \
+  --moe-expert-pager \
+  --host 127.0.0.1 \
+  --port 8080
+```
+
+### General debug command
+
+```bash
+./llama-server \
+  -m /path/to/model.gguf \
+  -c 2048 \
+  -ngl 999 \
+  --moe-expert-pager \
+  --moe-expert-log \
+  --host 127.0.0.1 \
+  --port 8080
+```
+
+### Explicit tuned command
+
+Most of these settings are automatically applied by `--moe-expert-pager`, but they can also be specified manually:
+
+```bash
+./llama-server \
+  -m /path/to/model.gguf \
+  -c 2048 \
+  -np 1 \
+  -ngl 999 \
+  --cache-ram 0 \
+  --ctx-checkpoints 0 \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --flash-attn on \
+  --moe-expert-pager \
+  --moe-expert-cache-experts 64 \
+  --moe-expert-prefetch 8 \
+  --moe-expert-cache-policy lfru \
+  --no-mmap \
+  --host 127.0.0.1 \
+  --port 8080
+```
+
+### Conservative limited-VRAM command
+
+Use this if auto VRAM sizing is unstable:
+
+```bash
+./llama-server \
+  -m /path/to/model.gguf \
+  -c 2048 \
+  -ngl 999 \
+  --moe-expert-pager \
+  --moe-expert-log \
+  --moe-expert-cache-vram-mib 8192 \
+  --moe-expert-vram-reserve-mib 2048 \
+  --moe-expert-cache-experts 48 \
+  --moe-expert-prefetch 4 \
+  --moe-expert-cache-policy lfru \
+  --host 127.0.0.1 \
+  --port 8080
+```
+
+### Aggressive limited-VRAM command
+
+Use this only after confirming the conservative command is stable:
+
+```bash
+./llama-server \
+  -m /path/to/model.gguf \
+  -c 2048 \
+  -ngl 999 \
+  --moe-expert-pager \
+  --moe-expert-log \
+  --moe-expert-cache-vram-mib 10240 \
+  --moe-expert-vram-reserve-mib 1536 \
+  --moe-expert-cache-experts 64 \
+  --moe-expert-prefetch 8 \
+  --moe-expert-cache-policy lfru \
+  --host 127.0.0.1 \
+  --port 8080
+```
+
+---
+
+## Multi-GPU usage
+
+Normal llama.cpp multi-GPU tensor parallelism can still be used with:
+
+```text
+--split-mode
+--tensor-split
+--main-gpu
+```
+
+However, the current `llama-quik` expert slot cache is not yet a fully distributed multi-GPU cache.
+
+Current design:
+
+```text
+All GPUs:
+  normal llama.cpp tensor/model parallel work
+
+Main GPU:
+  llama-quik MoE expert slot cache
+```
 
-    # [1]15.2701,[2]5.4007,[3]5.3073,[4]6.2965,[5]5.8940,[6]5.6096,[7]5.7942,[8]4.9297, ...
-    # Final estimate: PPL = 5.4007 +/- 0.67339
-    ```
+Future distributed design:
 
-    </details>
+```text
+GPU0:
+  expert cache shard 0
+
+GPU1:
+  expert cache shard 1
+
+GPU2:
+  expert cache shard 2
+
+GPU3:
+  expert cache shard 3
+```
+
+For a multi-GPU single-response setup, start with an explicit VRAM cache cap so the main GPU has room for both normal llama.cpp work and the expert cache:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 ./llama-server \
+  -m /path/to/model.gguf \
+  -c 2048 \
+  -ngl 999 \
+  --split-mode row \
+  --tensor-split 0.5,1,1,1 \
+  --main-gpu 0 \
+  --moe-expert-pager \
+  --moe-expert-log \
+  --moe-expert-cache-vram-mib 8192 \
+  --moe-expert-vram-reserve-mib 2048 \
+  --moe-expert-cache-experts 64 \
+  --moe-expert-prefetch 8 \
+  --moe-expert-cache-policy lfru \
+  --host 127.0.0.1 \
+  --port 8080
+```
+
+If row split is unstable or slower, try:
+
+```bash
+--split-mode layer
+```
+
+Do not describe the current expert cache as fully multi-GPU parallel yet. Normal model compute can use multiple GPUs, but the MoE expert pager cache itself is currently centered on the main CUDA device.
+
+---
+
+## Benchmarking
+
+Do not judge performance from the first prompt alone.
+
+The first prompt may include:
 
-- <details>
-    <summary>Measure KL divergence</summary>
+* routing profiler warmup
+* GPU expert cache allocation
+* JIT expert promotion
+* cache build stalls
 
-    ```bash
-    # TODO
-    ```
+Recommended benchmark flow:
 
-    </details>
+1. Start the server with `--moe-expert-pager --moe-expert-log`.
+2. Send a warmup prompt.
+3. Wait for backend activation.
+4. Send the same prompt again.
+5. Compare `eval time = ... tokens per second`.
+6. Use the second or third prompt as the warmed result.
 
-[^1]: [https://huggingface.co/docs/transformers/perplexity](https://huggingface.co/docs/transformers/perplexity)
+Useful warmup/test prompt:
 
-## [`llama-bench`](tools/llama-bench)
+```text
+Write a 3 paragraph essay on LLMs.
+```
 
-#### Benchmark the performance of the inference for various parameters.
+The backend is active when logs show:
 
-- <details open>
-    <summary>Run default benchmark</summary>
+```text
+backend=gpu-expert-slot-cache-active(jit-promote-cpu-to-gpu)
+```
 
-    ```bash
-    llama-bench -m model.gguf
+The most important timing line is:
 
-    # Output:
-    # | model               |       size |     params | backend    | threads |          test |                  t/s |
-    # | ------------------- | ---------: | ---------: | ---------- | ------: | ------------: | -------------------: |
-    # | qwen2 1.5B Q4_0     | 885.97 MiB |     1.54 B | Metal,BLAS |      16 |         pp512 |      5765.41 ± 20.55 |
-    # | qwen2 1.5B Q4_0     | 885.97 MiB |     1.54 B | Metal,BLAS |      16 |         tg128 |        197.71 ± 0.81 |
-    #
-    # build: 3e0ba0e60 (4229)
-    ```
+```text
+eval time = ... tokens per second
+```
 
-    </details>
+The less important timing line is:
 
-## [`llama-simple`](examples/simple)
+```text
+prompt eval time = ... tokens per second
+```
 
-#### A minimal example for implementing apps with `llama.cpp`. Useful for developers.
+Prompt processing may use safer fallback paths, while generated-token decode is where the pager is intended to help most.
 
-- <details>
-    <summary>Basic text completion</summary>
+---
 
-    ```bash
-    llama-simple -m model.gguf
+## Comparing against normal llama.cpp
 
-    # Hello my name is Kaitlyn and I am a 16 year old girl. I am a junior in high school and I am currently taking a class called "The Art of
-    ```
+Normal tuned llama.cpp baseline:
 
-    </details>
+```bash
+./llama-server \
+  -m /path/to/model.gguf \
+  -c 2048 \
+  -np 1 \
+  -ngl 999 \
+  --no-mmap \
+  --flash-attn on \
+  --cache-ram 0 \
+  --ctx-checkpoints 0 \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --host 127.0.0.1 \
+  --port 8080
+```
 
+llama-quik hard backend:
+
+```bash
+./llama-server \
+  -m /path/to/model.gguf \
+  -c 2048 \
+  -ngl 999 \
+  --moe-expert-pager \
+  --host 127.0.0.1 \
+  --port 8080
+```
+
+For fair comparison:
+
+* use the same model
+* use the same context size
+* use the same max tokens
+* use the same sampling settings
+* compare warmed second-prompt decode speed
+* compare `eval time`, not just prompt processing speed
+
+---
+
+## Command-line options
+
+### `--moe-expert-pager`
+
+Enables the MoE expert pager.
+
+This starts routed expert tensors in CPU memory, profiles expert routing, then activates the GPU expert cache after enough samples are collected.
+
+---
+
+### `--moe-expert-log`
+
+Prints MoE pager summaries.
+
+Useful for verifying backend activation, cache size, profiler status, and general behavior.
+
+Recommended for testing:
+
+```bash
+--moe-expert-pager --moe-expert-log
+```
+
+Recommended for benchmarking after validation:
+
+```bash
+--moe-expert-pager
+```
+
+---
+
+### `--moe-expert-cache-experts N`
+
+Controls the number of expert slots per cached expert tensor/bank.
+
+Example:
+
+```bash
+--moe-expert-cache-experts 64
+```
+
+Lower values use less VRAM but may increase misses and evictions.
+
+Higher values can reduce misses but consume more VRAM.
+
+Common values:
+
+```text
+48  = conservative
+64  = recommended default
+96  = aggressive
+128 = very aggressive
+```
+
+---
+
+### `--moe-expert-prefetch N`
+
+Controls how many likely-needed experts the pager tries to prepare ahead of time.
+
+Example:
+
+```bash
+--moe-expert-prefetch 8
+```
+
+Lower values reduce CPU->GPU copy pressure.
+
+Higher values may warm the cache faster, but can waste bandwidth if predictions are poor.
+
+Common values:
+
+```text
+4  = conservative
+8  = recommended
+16 = aggressive
+```
+
+---
+
+### `--moe-expert-cache-policy POLICY`
+
+Controls eviction policy.
+
+Supported policies:
+
+```text
+lru
+lfu
+lfru
+```
+
+Meaning:
+
+```text
+lru:
+  least recently used
+
+lfu:
+  least frequently used
+
+lfru:
+  hybrid frequency + recency policy
+```
+
+Recommended:
+
+```bash
+--moe-expert-cache-policy lfru
+```
+
+MoE routing often has both short-term locality and long-term hot experts, so `lfru` is usually the best default.
+
+---
+
+### `--moe-expert-cache-vram-mib N`
+
+Caps how much VRAM the pager may use for the expert cache.
+
+Example:
+
+```bash
+--moe-expert-cache-vram-mib 8192
+```
+
+If omitted or set to `0`, auto mode tries to use available VRAM after reserve.
+
+For testing, explicit caps are safer.
+
+---
+
+### `--moe-expert-vram-reserve-mib N`
+
+Leaves a safety reserve of free VRAM.
+
+Example:
+
+```bash
+--moe-expert-vram-reserve-mib 2048
+```
+
+Recommended values:
+
+```text
+512  = aggressive
+1024 = moderate
+1536 = safer
+2048 = conservative
+```
+
+Older GPUs and multi-GPU setups usually need a larger reserve.
+
+---
+
+### `--moe-expert-vram-max-mib N`
+
+Sets a maximum auto-sized VRAM limit.
+
+Useful if you want auto-sizing but do not want it to consume nearly all available VRAM.
+
+---
+
+### `--moe-expert-whole-layer-cache`
+
+Uses the older whole-layer cache backend instead of the hard per-expert slot backend.
+
+This is slower and less VRAM-efficient, but it is simpler and useful for debugging.
+
+---
+
+## Understanding the logs
+
+### Profiler warming up
+
+```text
+ready=false
+backend=gpu-cache-arena-reserved(cpu-moe-fallback)
+```
+
+The profiler is collecting routing data. Expect baseline-ish speed.
+
+---
+
+### Hard backend activated
+
+```text
+backend=gpu-expert-slot-cache-active(jit-promote-cpu-to-gpu)
+```
+
+The expert slot cache is active. Decode should be faster after the cache warms.
+
+---
+
+### Example activation line
+
+```text
+MoE expert hard backend active: allocated <N> per-expert slot tensors across <N> hot layers on CUDA<device> (<VRAM> MiB, <slots> slots/tensor)
+```
+
+Meaning:
+
+```text
+<N> cached expert tensor banks
+<N> hot layers involved
+<VRAM> MiB VRAM allocated
+<slots> slots per cached tensor bank
+```
+
+---
+
+## Observed performance behavior
+
+Performance depends heavily on:
+
+* model quantization
+* CPU RAM bandwidth
+* PCIe bandwidth
+* GPU architecture
+* prompt length
+* output length
+* routing locality
+* cache churn
+* number of cached slots
+* VRAM cap/reserve
+* whether the prompt is first or warmed
+
+Approximate observed progression in one test configuration:
+
+```text
+Original / early baseline:
+  ~1.26 tokens/sec
+
+Tuned CPU-MoE fallback:
+  ~5.58 tokens/sec
+
+With Flash Attention:
+  ~6.38 tokens/sec
+
+With --no-mmap and tuned settings:
+  ~11.33 tokens/sec
+
+Best warmed llama-quik windows:
+  ~13–14 tokens/sec
+```
+
+These numbers are not guaranteed. They are examples of observed behavior from one test configuration.
+
+In longer responses, token/sec may start strong after the expert cache warms, then gradually fall later in the generation. This is likely caused by routing shifts, cache churn, evictions, or repeated CPU-to-GPU expert promotion.
+
+---
+
+## Known limitations
+
+### First prompt is slower
+
+The first prompt includes profiling and cache setup.
+
+Use the second or third prompt for benchmarking.
+
+---
+
+### Prompt phase may use fallback
+
+The current hard backend uses the safer path for prompt/batch processing and the GPU expert slot cache for decode.
+
+This avoids batch-shape issues and prioritizes generated token/sec.
+
+---
+
+### Long generations may slow down
+
+Very long generations can degrade if the cache churns or if routing shifts over time.
+
+Future work will add detailed real hit/miss counters and better long-generation eviction behavior.
+
+---
+
+### Expert cache is not fully multi-GPU distributed yet
+
+Normal llama.cpp multi-GPU tensor split works.
+
+The expert slot cache itself is currently centered on the main CUDA device.
+
+---
+
+### CUDA graphs and dynamic promotion
+
+Dynamic expert promotion is incompatible with CUDA graph capture in the affected graph.
+
+`llama-quik` bypasses graph capture for the dynamic cache path.
+
+---
+
+## Potential fixes and optimization directions
+
+`llama-quik` is still experimental, and two major optimization areas remain: long-generation slowdown and true distributed multi-GPU expert caching.
+
+### Long-generation slowdown
+
+Possible causes:
+
+```text
+routing pattern shifts as the response continues
+hot experts change over time
+cache slots churn between old and new expert sets
+repeated CPU->GPU promotions add copy overhead
+eviction policy is not yet tuned for long generations
+some layers may need more slots than others
+```
+
+Potential future fixes:
+
+```text
+real backend hit/miss counters:
+  measure actual hard-backend slot hits, misses, promotions, evictions, and copied bytes
+
+per-layer cache statistics:
+  show which MoE layers are stable and which layers churn
+
+adaptive per-layer slot allocation:
+  give more slots to layers with high traffic or high miss rates
+
+expert pinning:
+  permanently keep the most-used experts resident once they prove hot enough
+
+warm-profile preloading:
+  after the warmup prompt, pre-promote the top experts before the real benchmark prompt starts
+
+long-context re-profiling:
+  periodically refresh the hot-expert plan during very long generations
+
+promotion throttling:
+  avoid too many CPU->GPU copies in a short window if promotion traffic starts hurting decode speed
+
+async promotion:
+  move selected experts with safer stream/event scheduling so copies block decode less
+
+better eviction scoring:
+  combine recency, frequency, layer importance, and promotion cost instead of using a simple global policy
+```
+
+---
+
+### Multi-GPU expert cache
+
+The ideal future version would allow all GPUs to contribute not only to normal tensor-split model execution, but also to the MoE expert cache itself.
+
+Potential approaches:
+
+```text
+shard by layer:
+  assign different MoE layers' expert caches to different GPUs
+
+shard by expert ID:
+  assign expert ID ranges to different GPUs
+
+replicate hottest experts:
+  keep the most common experts on multiple GPUs to reduce cross-device traffic
+
+device-local routing:
+  send selected expert work to the GPU that owns the needed expert slot
+
+cross-GPU result merge:
+  gather expert outputs back into the normal llama.cpp graph after expert computation
+
+topology-aware planning:
+  choose cache placement based on PCIe/NVLink bandwidth and peer-to-peer support
+
+multi-device cache telemetry:
+  report hits, misses, promotions, and evictions per GPU
+```
+
+---
+
+## Troubleshooting
+
+### Startup is slower
+
+Expected. The pager reserves VRAM, initializes cache metadata, profiles routing, and promotes experts.
+
+For faster testing, cap the cache:
+
+```bash
+--moe-expert-cache-vram-mib 8192
+```
+
+---
+
+### Too much VRAM usage
+
+Increase reserve or cap cache:
+
+```bash
+--moe-expert-vram-reserve-mib 2048
+--moe-expert-cache-vram-mib 8192
+```
+
+---
+
+### Backend does not activate
+
+Run with:
+
+```bash
+--moe-expert-log
+```
+
+Look for:
+
+```text
+backend=gpu-expert-slot-cache-active(jit-promote-cpu-to-gpu)
+```
+
+If the backend remains in fallback mode, try a longer warmup prompt or lower the cache VRAM cap/reserve settings.
+
+---
+
+## Roadmap
+
+Planned improvements:
+
+* Real backend hit/miss counters.
+* Per-layer hard-backend cache hit rate reporting.
+* Promotion/eviction telemetry.
+* Better long-generation cache stability.
+* Prewarming top experts after profiler warmup.
+* Distributed multi-GPU expert slot caches.
+* Async CPU->GPU promotion with safer stream/event scheduling.
+* Smarter per-layer slot allocation.
+* Optional saved profile per model hash.
+* Better tuning presets for older CUDA GPUs.
+* More correctness tests for expert ID remapping.
+
+---
+
+## Project philosophy
+
+`llama-quik` prioritizes practical MoE inference on real hardware over perfect theoretical design.
+
+The current implementation is intentionally incremental:
+
+```text
+v1:
+  CPU-MoE fallback + profiler
+
+v2:
+  whole-layer GPU expert cache
+
+v3:
+  hard backend per-expert GPU slot cache
+
+future:
+  fully distributed multi-GPU expert cache
+```
+
+---
+
+## Credits
+
+`llama-quik` is based on `llama.cpp` and GGML.
+
+This project is experimental and should be treated as a research/performance patchset until the backend is fully validated across more models, GPUs, and CUDA versions.
+
+---
 
 ## Contributing
 
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- See [good first issues](https://github.com/ggml-org/llama.cpp/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) for tasks suitable for first contributions
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-- Make sure to read this: [Inference at the edge](https://github.com/ggml-org/llama.cpp/discussions/205)
-- A bit of backstory for those who are interested: [Changelog podcast](https://changelog.com/podcast/532)
+Pull requests, bug reports, testing notes, and performance results are welcome.
 
-## Other documentation
+`llama-quik` is experimental and needs help from people testing different models, GPUs, CUDA versions, operating systems, and multi-GPU setups. If you find a crash, build issue, incorrect behavior, or performance regression, please open an issue with as much detail as possible.
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+Helpful contributions include:
 
-#### Development documentation
+* Linux and Windows build fixes.
+* CUDA backend fixes.
+* Multi-GPU expert cache experiments.
+* Better long-generation cache stability.
+* Real hit/miss/promotion/eviction telemetry.
+* Better default settings for different GPU classes.
+* Documentation improvements.
+* Reproducible benchmarks against normal llama.cpp.
+* Testing with different MoE GGUF models and quantizations.
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
+This project is rough and experimental, so even small fixes, logs, and benchmark results are useful.
 
-#### Seminal papers and background on the models
+---
 
-If your issue is with model generation quality, then please at least scan the following links and papers to understand the limitations of LLaMA models. This is especially important when choosing an appropriate model size and appreciating both the significant and subtle differences between LLaMA models and ChatGPT:
-- LLaMA:
-    - [Introducing LLaMA: A foundational, 65-billion-parameter large language model](https://ai.facebook.com/blog/large-language-model-llama-meta-ai/)
-    - [LLaMA: Open and Efficient Foundation Language Models](https://arxiv.org/abs/2302.13971)
-- GPT-3
-    - [Language Models are Few-Shot Learners](https://arxiv.org/abs/2005.14165)
-- GPT-3.5 / InstructGPT / ChatGPT:
-    - [Aligning language models to follow instructions](https://openai.com/research/instruction-following)
-    - [Training language models to follow instructions with human feedback](https://arxiv.org/abs/2203.02155)
+## Disclaimer
 
-## XCFramework
-The XCFramework is a precompiled version of the library for iOS, visionOS, tvOS,
-and macOS. It can be used in Swift projects without the need to compile the
-library from source. For example:
-```swift
-// swift-tools-version: 5.10
-// The swift-tools-version declares the minimum version of Swift required to build this package.
+This is not an official `llama.cpp` feature.
 
-import PackageDescription
+`llama-quik` is an experimental patchset I built in my free time over a short period (a couple of hours). It is a rough prototype, not a polished product. It may have bugs, crash, perform poorly, or not work at all on some systems.
 
-let package = Package(
-    name: "MyLlamaPackage",
-    targets: [
-        .executableTarget(
-            name: "MyLlamaPackage",
-            dependencies: [
-                "LlamaFramework"
-            ]),
-        .binaryTarget(
-            name: "LlamaFramework",
-            url: "https://github.com/ggml-org/llama.cpp/releases/download/b5046/llama-b5046-xcframework.zip",
-            checksum: "c19be78b5f00d8d29a25da41042cb7afa094cbf6280a225abe614b03b20029ab"
-        )
-    ]
-)
-```
-The above example is using an intermediate build `b5046` of the library. This can be modified
-to use a different version by changing the URL and checksum.
+I may not come back to maintain or fix this project, so pull requests and community contributions may be the only way it continues improving.
 
-## Completions
-Command-line completion is available for some environments.
+Use at your own risk. Expect bugs, crashes, backend-specific issues, build issues, and large performance variation across models, GPUs, CUDA versions, operating systems, and driver setups.
 
-#### Bash Completion
-```bash
-$ build/bin/llama-cli --completion-bash > ~/.llama-completion.bash
-$ source ~/.llama-completion.bash
-```
-Optionally this can be added to your `.bashrc` or `.bash_profile` to load it
-automatically. For example:
-```console
-$ echo "source ~/.llama-completion.bash" >> ~/.bashrc
-```
-
-## Dependencies
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [stb-image](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+Always compare against a normal tuned llama.cpp baseline before judging speedups.
