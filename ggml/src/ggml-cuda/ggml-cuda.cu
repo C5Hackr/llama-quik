@@ -1,4 +1,5 @@
 #include "ggml-cuda.h"
+#include "ggml-moe-cache.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -2630,10 +2631,142 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 }
 
+
+static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+static ggml_moe_expert_slot_cache * ggml_cuda_moe_slot_cache_meta(const ggml_tensor * t) {
+    if (t == nullptr || t->op_params[0] != GGML_MOE_EXPERT_SLOT_CACHE_MAGIC || t->extra == nullptr) {
+        return nullptr;
+    }
+
+    ggml_moe_expert_slot_cache * meta = (ggml_moe_expert_slot_cache *) t->extra;
+    if (meta->magic != GGML_MOE_EXPERT_SLOT_CACHE_MAGIC || meta->cpu_tensor == nullptr || meta->n_slots <= 0 || meta->n_experts <= 0) {
+        return nullptr;
+    }
+
+    return meta;
+}
+
+static bool ggml_cuda_moe_mul_mat_id_slot_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_moe_expert_slot_cache * meta) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * ids  = dst->src[2];
+
+    if (src0 == nullptr || ids == nullptr || ids->type != GGML_TYPE_I32 || src0->data == nullptr || meta == nullptr || meta->cpu_tensor == nullptr) {
+        return false;
+    }
+
+    cudaStream_t stream = ctx.stream();
+
+    std::vector<char> ids_host(ggml_nbytes(ids));
+    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<char> slot_ids_host(ggml_nbytes(ids));
+    std::vector<int32_t> unique_ids;
+    unique_ids.reserve((size_t) ids->ne[0] * (size_t) ids->ne[1]);
+
+    auto add_unique = [&unique_ids](int32_t expert) {
+        if (std::find(unique_ids.begin(), unique_ids.end(), expert) == unique_ids.end()) {
+            unique_ids.push_back(expert);
+        }
+    };
+
+    for (int64_t i1 = 0; i1 < ids->ne[1]; ++i1) {
+        for (int64_t i0 = 0; i0 < ids->ne[0]; ++i0) {
+            const int32_t expert = *(const int32_t *)(ids_host.data() + i1*ids->nb[1] + i0*ids->nb[0]);
+            if (expert < 0 || expert >= meta->n_experts) {
+                return false;
+            }
+            add_unique(expert);
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(meta->mutex);
+
+        auto choose_slot = [&]() -> int32_t {
+            for (int32_t i = 0; i < meta->n_slots; ++i) {
+                if (meta->slot_to_expert[(size_t) i] < 0) {
+                    return i;
+                }
+            }
+
+            int32_t best = 0;
+            uint64_t best_tick = meta->slot_last_access.empty() ? 0 : meta->slot_last_access[0];
+            for (int32_t i = 1; i < meta->n_slots; ++i) {
+                if (meta->slot_last_access[(size_t) i] < best_tick) {
+                    best = i;
+                    best_tick = meta->slot_last_access[(size_t) i];
+                }
+            }
+            return best;
+        };
+
+        for (const int32_t expert : unique_ids) {
+            auto it = meta->expert_to_slot.find(expert);
+            int32_t slot = -1;
+            if (it != meta->expert_to_slot.end()) {
+                slot = it->second;
+            } else {
+                slot = choose_slot();
+                const int32_t evicted = meta->slot_to_expert[(size_t) slot];
+                if (evicted >= 0) {
+                    meta->expert_to_slot.erase(evicted);
+                }
+
+                const char * src_ptr = (const char *) meta->cpu_tensor->data + (size_t) expert * meta->cpu_expert_stride_bytes;
+                char * dst_ptr = (char *) src0->data + (size_t) slot * meta->gpu_slot_stride_bytes;
+                CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, meta->copy_bytes, cudaMemcpyHostToDevice, stream));
+
+                meta->slot_to_expert[(size_t) slot] = expert;
+                meta->expert_to_slot[expert] = slot;
+            }
+            meta->slot_last_access[(size_t) slot] = ++meta->clock;
+        }
+
+        for (int64_t i1 = 0; i1 < ids->ne[1]; ++i1) {
+            for (int64_t i0 = 0; i0 < ids->ne[0]; ++i0) {
+                const int32_t expert = *(const int32_t *)(ids_host.data() + i1*ids->nb[1] + i0*ids->nb[0]);
+                const auto it = meta->expert_to_slot.find(expert);
+                if (it == meta->expert_to_slot.end()) {
+                    return false;
+                }
+                *(int32_t *)(slot_ids_host.data() + i1*ids->nb[1] + i0*ids->nb[0]) = it->second;
+            }
+        }
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    ggml_cuda_pool_alloc<int32_t> slot_ids_dev(ctx.pool(), ggml_nbytes(ids) / sizeof(int32_t));
+    CUDA_CHECK(cudaMemcpyAsync(slot_ids_dev.ptr, slot_ids_host.data(), ggml_nbytes(ids), cudaMemcpyHostToDevice, stream));
+
+    ggml_tensor ids_slot = *ids;
+    ids_slot.data = slot_ids_dev.ptr;
+
+    ggml_tensor src0_plain = *src0;
+    src0_plain.op_params[0] = 0;
+    src0_plain.extra = nullptr;
+
+    ggml_tensor dst_plain = *dst;
+    dst_plain.src[0] = &src0_plain;
+    dst_plain.src[2] = &ids_slot;
+
+    ggml_cuda_mul_mat_id(ctx, &dst_plain);
+    return true;
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
+
+    if (ggml_moe_expert_slot_cache * moe_cache = ggml_cuda_moe_slot_cache_meta(src0)) {
+        if (ggml_cuda_moe_mul_mat_id_slot_cache(ctx, dst, moe_cache)) {
+            return;
+        }
+        GGML_ABORT("MoE expert slot cache could not satisfy this mul_mat_id call; this should be restricted to single-token decode graphs");
+    }
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
@@ -2712,7 +2845,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
                     tokens_per_expert[i02]++;
-                    break;
+                    // Do not break here: malformed or remapped ID tensors may contain
+                    // duplicate expert IDs for the same token. Handling each occurrence
+                    // keeps ids_to_sorted_host aligned with ne_get_rows and avoids an
+                    // assertion during prompt/batch processing.
                 }
             }
         }
@@ -3273,16 +3409,28 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
-            const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-            const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-            if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
-                // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
-                // TODO: figure out a way to enable for larger batch sizes, without hurting performance
-                // ref: https://github.com/ggml-org/llama.cpp/pull/18958
+            if (ggml_cuda_moe_slot_cache_meta(node->src[0]) != nullptr) {
+                // The experimental MoE expert slot-cache path performs runtime expert promotion
+                // and ID remapping with host/device copies and stream synchronization. Those
+                // operations are intentionally dynamic and cannot be recorded inside a CUDA
+                // graph capture. Disable graph capture for graphs that contain cached MoE
+                // expert-bank tensors so execution uses the normal stream path instead.
                 use_cuda_graph = false;
 #ifndef NDEBUG
-                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to MoE expert slot cache\n", __func__);
 #endif
+            } else {
+                const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
+                if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
+                    // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
+                    // TODO: figure out a way to enable for larger batch sizes, without hurting performance
+                    // ref: https://github.com/ggml-org/llama.cpp/pull/18958
+                    use_cuda_graph = false;
+#ifndef NDEBUG
+                    GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
+#endif
+                }
             }
         }
 
