@@ -7,11 +7,16 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "ggml-moe-cache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <cstdint>
 #include <map>
+#include <memory>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 struct llama_model;
@@ -234,6 +239,13 @@ private:
     // from backend into host-side embd_layer_inp buffers
     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
+    void moe_expert_telemetry_init();
+    void moe_expert_vram_cache_init();
+    void moe_expert_gpu_cache_maybe_build();
+    ggml_tensor * moe_expert_gpu_cache_lookup(int il, ggml_tensor * src) const;
+    void moe_expert_telemetry_record(const llm_graph_result * res);
+    void moe_expert_telemetry_print(bool final) const;
+
     //
     // graph
     //
@@ -370,6 +382,122 @@ private:
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     bool has_evaluated_once = false;
+
+    struct moe_expert_cache_entry {
+        uint64_t last_access = 0;
+        uint64_t frequency   = 0;
+    };
+
+    struct moe_expert_cache_sim_state {
+        int32_t capacity = 0;
+        bool per_layer   = false;
+
+        uint64_t accesses    = 0;
+        uint64_t hits        = 0;
+        uint64_t misses      = 0;
+        uint64_t last_access = 0;
+
+        std::unordered_map<uint64_t, moe_expert_cache_entry> cache;
+    };
+
+    struct moe_expert_telemetry_state {
+        bool initialized = false;
+        bool enabled     = false; // runtime profiler/capture enabled
+        bool log_enabled = false; // user-facing summaries enabled
+        bool trace       = false; // developer diagnostics enabled
+        bool auto_profile = true;
+        bool auto_profile_reported = false;
+
+        int32_t cache_experts = 64;
+        int32_t log_every     = 5000;
+
+        std::string policy = "lfru";
+
+        uint64_t profile_target_accesses = 50000;
+
+        uint64_t decode_calls  = 0; // llama_context::decode calls observed while telemetry is enabled
+        uint64_t process_calls = 0; // process_ubatch calls observed while telemetry is enabled
+        uint64_t record_calls  = 0; // moe_expert_telemetry_record calls observed while telemetry is enabled
+        uint64_t batches       = 0; // ubatches with at least one selected_experts tensor list
+        uint64_t ubatches      = 0; // all ubatches observed while telemetry is enabled
+        uint64_t accesses      = 0;
+        uint64_t prompt_accesses = 0;
+        uint64_t decode_accesses = 0;
+        uint64_t hits          = 0;
+        uint64_t misses        = 0;
+        uint64_t last_log_at   = 0;
+        uint64_t last_access   = 0;
+
+        uint64_t tensor_lists_empty = 0;
+        uint64_t tensors_seen       = 0;
+        uint64_t tensors_i32        = 0;
+        uint64_t score_tensors_seen = 0; // routing score tensors used to reconstruct top-k IDs
+        uint64_t score_tensors_f32  = 0;
+        uint64_t score_rows_read    = 0;
+        uint64_t score_ids_derived  = 0;
+        uint64_t tensors_bad_type   = 0;
+        uint64_t tensors_no_backend = 0;
+        uint64_t tensors_zero_ids   = 0;
+        uint64_t ids_read           = 0;
+        uint64_t ids_valid          = 0;
+        uint64_t ids_invalid        = 0;
+        uint64_t ids_local          = 0; // IDs already in [0, n_expert)
+        uint64_t ids_global         = 0; // IDs accepted from a flattened layer/expert ID space
+        uint64_t ids_global_rejected = 0; // non-negative IDs outside both local and inferred global spaces
+        uint64_t ids_strided_rows   = 0; // rows read using tensor strides, important for argsort_top_k views
+
+        bool     vram_arena_requested = false;
+        bool     vram_arena_active    = false;
+        size_t   vram_arena_bytes     = 0;
+        int32_t  vram_arena_mib_req   = 0;
+        int32_t  vram_arena_mib_auto  = 0;
+        int32_t  vram_arena_mib_reserve = 0;
+        std::string vram_arena_backend;
+
+        uint64_t decode_tokens_last = 0;
+        uint64_t decode_outputs_last = 0;
+
+        std::unordered_map<uint64_t, moe_expert_cache_entry> cache;
+        std::unordered_map<int32_t, uint64_t> layer_accesses;
+        std::vector<moe_expert_cache_sim_state> global_sims;
+        std::vector<moe_expert_cache_sim_state> per_layer_sims;
+        std::vector<int32_t> tmp_ids;
+        std::vector<float>   tmp_scores;
+        std::vector<int32_t> tmp_top_ids;
+        std::vector<float>   tmp_top_vals;
+    };
+
+    moe_expert_telemetry_state moe_expert_telemetry;
+
+    // Experimental whole-layer expert tensor cache. Once the profiler has enough
+    // data, the pager can duplicate entire MoE expert tensors for the hottest
+    // layers onto the first GPU backend. This is a conservative, correct first
+    // implementation: cached tensors preserve the original expert axis, so the
+    // existing ggml_mul_mat_id op can use them without ID remapping. Layers that
+    // are not cached continue using the CPU-MoE tensors.
+    struct moe_expert_gpu_tensor_cache_state {
+        bool attempted = false;
+        bool active    = false;
+        uint64_t epoch = 0;
+        size_t bytes   = 0;
+        std::string backend;
+
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buffer;
+        std::unordered_map<const ggml_tensor *, ggml_tensor *> tensor_map;
+        std::vector<int32_t> cached_layers;
+
+        bool expert_slot_backend = false;
+        int32_t slots_per_tensor = 0;
+        size_t slot_tensor_count = 0;
+        std::vector<std::unique_ptr<ggml_moe_expert_slot_cache>> slot_caches;
+    };
+
+    moe_expert_gpu_tensor_cache_state moe_expert_gpu_cache;
+
+    // Legacy/staging arena used only before a real tensor cache is built. It is
+    // released before allocating cached expert tensor copies.
+    ggml_backend_buffer_ptr moe_expert_vram_cache_buffer;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

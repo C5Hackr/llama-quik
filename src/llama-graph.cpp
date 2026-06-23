@@ -12,8 +12,10 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -883,6 +885,15 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
     return true;
 }
 
+
+static bool llama_moe_expert_telemetry_enabled_env() {
+    const char * v = std::getenv("LLAMA_MOE_EXPERT_TELEMETRY");
+    if (v == nullptr || v[0] == '\0') {
+        return false;
+    }
+    return !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "FALSE") == 0 || strcmp(v, "off") == 0 || strcmp(v, "OFF") == 0);
+}
+
 //
 // llm_graph_result
 //
@@ -907,6 +918,8 @@ void llm_graph_result::reset() {
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
+
+    t_moe_selected_experts.clear();
 
     t_sampled.clear();
     t_sampled_probs.clear();
@@ -958,6 +971,22 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             }
         }
     }
+    if (moe_expert_telemetry_enabled) {
+        for (const auto & t_info : t_moe_selected_experts) {
+            // Prefer the routing score tensor for telemetry. On CUDA, top-k MoE
+            // fusion writes the selected ID view sparsely with a full-expert row
+            // stride, and reading that view directly has proven fragile. The
+            // score tensor is the exact source used by ggml_argsort_top_k(), so
+            // the runtime can reconstruct selected expert IDs deterministically.
+            if (t_info.t_scores != nullptr) {
+                ggml_set_output(t_info.t_scores);
+            }
+            if (t_info.t_selected != nullptr) {
+                ggml_set_output(t_info.t_selected);
+            }
+        }
+    }
+
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {
             ggml_set_output(t);
@@ -1019,6 +1048,37 @@ llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
 
 void llm_graph_result::set_params(const llm_graph_params & params) {
     this->params = params;
+    moe_expert_telemetry_enabled = llama_moe_expert_telemetry_enabled_env();
+}
+
+void llm_graph_result::add_moe_selected_experts(int il, int64_t n_expert, int64_t n_expert_used, ggml_tensor * t_selected, ggml_tensor * t_scores) {
+    // Always remember this tensor when it exists. Whether it is marked as an output
+    // is controlled in set_outputs() via moe_expert_telemetry_enabled. Keeping the
+    // pointer list unconditional lets runtime telemetry report a useful diagnostic
+    // if the env/graph-output path is not active for a model.
+    if (t_selected == nullptr) {
+        return;
+    }
+
+    // ggml_argsort_top_k() returns a VIEW over the full argsort result. Some
+    // model paths pass a conservative/specialized n_expert value into
+    // build_moe_ffn(), while the actual selected ID tensor still uses the full
+    // router ID space from the argsort source. Derive the telemetry validation
+    // range from the tensor graph when possible so we do not mark every expert
+    // ID as invalid for GPT-OSS / grouped-router paths.
+    int64_t id_space = n_expert;
+    if (t_selected->src[0] != nullptr) {
+        id_space = std::max<int64_t>(id_space, t_selected->src[0]->ne[0]);
+        if (t_selected->src[0]->src[0] != nullptr) {
+            id_space = std::max<int64_t>(id_space, t_selected->src[0]->src[0]->ne[0]);
+        }
+    }
+
+    if (t_scores != nullptr) {
+        id_space = std::max<int64_t>(id_space, t_scores->ne[0]);
+    }
+
+    t_moe_selected_experts.push_back({ il, id_space, n_expert_used, t_selected, t_scores });
 }
 
 //
@@ -1064,6 +1124,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     samplers         (params.samplers),
     cb_func          (params.cb),
+    moe_expert_cache_lookup(params.moe_expert_cache_lookup),
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
@@ -1521,6 +1582,28 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
+    // MoE expert GPU cache substitution. For the hard per-expert slot-cache backend,
+    // only substitute during single-token decode graphs. Prompt/batch graphs can
+    // contain more distinct routed experts than the slot bank can hold at once;
+    // keeping prompt processing on the original CPU-MoE tensors avoids unsafe
+    // fallback from a CUDA slot-cache tensor with un-remapped expert IDs.
+    //
+    // This preserves the high-value steady-state decode acceleration while making
+    // subsequent prompts safe after the cache has warmed.
+    if (moe_expert_cache_lookup && n_tokens == 1) {
+        up_exps          = moe_expert_cache_lookup(il, up_exps);
+        up_exps_b        = moe_expert_cache_lookup(il, up_exps_b);
+        gate_exps        = moe_expert_cache_lookup(il, gate_exps);
+        gate_exps_b      = moe_expert_cache_lookup(il, gate_exps_b);
+        down_exps        = moe_expert_cache_lookup(il, down_exps);
+        down_exps_b      = moe_expert_cache_lookup(il, down_exps_b);
+        gate_up_exps     = moe_expert_cache_lookup(il, gate_up_exps);
+        gate_up_exps_b   = moe_expert_cache_lookup(il, gate_up_exps_b);
+        up_exps_s        = moe_expert_cache_lookup(il, up_exps_s);
+        gate_exps_s      = moe_expert_cache_lookup(il, gate_exps_s);
+        down_exps_s      = moe_expert_cache_lookup(il, down_exps_s);
+    }
+
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
@@ -1603,14 +1686,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(selected_experts->src[0], "ffn_moe_argsort", il);
     cb(selected_experts, "ffn_moe_topk", il);
 
+    // Some MoE variants, including grouped-expert paths, transform the raw top-k
+    // output before feeding it to ggml_mul_mat_id/build_lora_mm_id. Telemetry
+    // must observe the final ID tensor used by the expert matmul, not the raw
+    // pre-adjustment argsort result; otherwise almost every ID appears invalid.
+    int64_t n_expert_selected_id_space = n_expert;
+
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
         selected_experts = ggml_cast(ctx0, ggml_scale(ctx0, f_sel, 1.0f / float(hparams.n_group_experts)), GGML_TYPE_I32);
+        n_expert_selected_id_space = hparams.n_expert;
         probs = ggml_reshape_3d(ctx0, probs, 1, hparams.n_expert, n_tokens);
     } else {
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }
+
+    res->add_moe_selected_experts(il, n_expert_selected_id_space, n_expert_used, selected_experts, selection_probs);
 
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);

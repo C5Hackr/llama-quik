@@ -582,6 +582,7 @@ public:
 
 // callback that allows us to apply custom logic to each tensor (e.g. ggml-alloc, offloading, etc.)
 using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il)>;
+using llm_moe_expert_cache_lookup = std::function<ggml_tensor *(int il, ggml_tensor * src)>;
 
 class llm_graph_result;
 
@@ -623,6 +624,12 @@ struct llm_graph_params {
     uint32_t n_outputs;
 
     llm_graph_cb cb;
+
+    // Optional whole-layer MoE tensor cache lookup. When active, this maps
+    // original CPU expert tensors to identical GPU-resident copies. It does not
+    // change selected expert IDs; cached tensors keep the original expert axis.
+    llm_moe_expert_cache_lookup moe_expert_cache_lookup;
+    uint64_t moe_expert_cache_epoch = 0;
 
     llm_graph_result * res;
 
@@ -692,6 +699,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            moe_expert_cache_epoch           == other.moe_expert_cache_epoch           &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -712,7 +720,19 @@ public:
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
 
+    struct moe_selected_experts_tensor {
+        int          il;
+        int64_t      n_expert;
+        int64_t      n_expert_used;
+        ggml_tensor * t_selected; // final ID tensor passed to ggml_mul_mat_id
+        ggml_tensor * t_scores;   // final routing scores used to derive t_selected; preferred for telemetry
+    };
+
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
+
+    const std::vector<moe_selected_experts_tensor> & get_moe_selected_experts() const { return t_moe_selected_experts; }
+
+    void add_moe_selected_experts(int il, int64_t n_expert, int64_t n_expert_used, ggml_tensor * t_selected, ggml_tensor * t_scores);
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -744,6 +764,10 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
+
+    std::vector<moe_selected_experts_tensor> t_moe_selected_experts;
+
+    bool moe_expert_telemetry_enabled = false;
 
     std::map<llama_seq_id, ggml_tensor *> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor *> t_candidates;
@@ -835,6 +859,7 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
+    const llm_moe_expert_cache_lookup moe_expert_cache_lookup;
 
     llm_graph_result * res;
 

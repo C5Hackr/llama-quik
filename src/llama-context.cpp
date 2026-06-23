@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -12,11 +13,16 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
+#include <cfloat>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <utility>
+#include <set>
 
 //
 // llama_context
@@ -28,6 +34,35 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
     }
     throw std::runtime_error("Unsupported ctx type");
+}
+
+static bool llama_env_bool(const char * name, bool def) {
+    const char * v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return def;
+    }
+    return !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "FALSE") == 0 || strcmp(v, "off") == 0 || strcmp(v, "OFF") == 0);
+}
+
+static int32_t llama_env_i32(const char * name, int32_t def) {
+    const char * v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return def;
+    }
+    char * end = nullptr;
+    const long val = std::strtol(v, &end, 10);
+    if (end == v) {
+        return def;
+    }
+    return (int32_t) val;
+}
+
+static std::string llama_env_str(const char * name, const char * def) {
+    const char * v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return def;
+    }
+    return v;
 }
 
 llama_context::llama_context(
@@ -397,6 +432,7 @@ llama_context::llama_context(
         }
 
         sched_reserve();
+        moe_expert_vram_cache_init();
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -414,9 +450,15 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    // Initialize MoE telemetry at context creation so trace mode always leaves an
+    // obvious startup marker. The previous version only initialized lazily after
+    // graph execution, which made a broken graph hook look like silent success.
+    moe_expert_telemetry_init();
 }
 
 llama_context::~llama_context() {
+    moe_expert_telemetry_print(true);
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1302,6 +1344,13 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (moe_expert_telemetry.enabled) {
+        // Keep this counter hot, but do not log per ubatch. Per-ubatch logging
+        // overwhelms llama-server during token-by-token decode. Summaries are
+        // emitted from moe_expert_telemetry_record() at the configured interval.
+        moe_expert_telemetry.process_calls++;
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1370,7 +1419,964 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     ret = GGML_STATUS_SUCCESS;
 
+    moe_expert_telemetry_record(res);
+
     return res;
+}
+
+
+void llama_context::moe_expert_vram_cache_init() {
+    // Reserve the auto-sized GPU budget up front so the profiler/cache build
+    // has a stable VRAM target. After the profiler reaches its sample target,
+    // this staging buffer is released and replaced with real GPU copies of
+    // complete hot MoE-layer expert tensors. Auto mode uses all currently
+    // available GPU memory after LLAMA_MOE_EXPERT_VRAM_RESERVE_MIB.
+    moe_expert_telemetry_init();
+
+    auto & st = moe_expert_telemetry;
+    if (!st.enabled) {
+        return;
+    }
+
+    if (moe_expert_vram_cache_buffer) {
+        return;
+    }
+
+    const int32_t req_mib     = std::max<int32_t>(0, llama_env_i32("LLAMA_MOE_EXPERT_CACHE_VRAM_MIB", 0));
+    const int32_t reserve_mib = std::max<int32_t>(0, llama_env_i32("LLAMA_MOE_EXPERT_VRAM_RESERVE_MIB", 512));
+    const int32_t max_mib     = std::max<int32_t>(0, llama_env_i32("LLAMA_MOE_EXPERT_VRAM_MAX_MIB", 0));
+
+    st.vram_arena_requested   = true;
+    st.vram_arena_mib_req     = req_mib;
+    st.vram_arena_mib_reserve = reserve_mib;
+
+    constexpr size_t MiB = 1024ull * 1024ull;
+
+    for (auto & backend : backends) {
+        if (!backend) {
+            continue;
+        }
+
+        ggml_backend_t be = backend.get();
+        ggml_backend_dev_t dev = ggml_backend_get_device(be);
+        if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+
+        size_t target_mib = 0;
+        if (req_mib > 0) {
+            target_mib = (size_t) req_mib;
+        } else {
+            const size_t free_mib = free_bytes / MiB;
+            if (free_mib <= (size_t) reserve_mib + 256) {
+                continue;
+            }
+            target_mib = free_mib - (size_t) reserve_mib;
+            if (max_mib > 0) {
+                target_mib = std::min(target_mib, (size_t) max_mib);
+            }
+        }
+
+        st.vram_arena_mib_auto = (int32_t) target_mib;
+
+        if (target_mib < 256) {
+            continue;
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(be);
+        if (buft == nullptr || ggml_backend_buft_is_host(buft)) {
+            continue;
+        }
+
+        // Try the requested/auto size first, then back off in 256 MiB steps.
+        // This keeps the default behavior close to "use all available VRAM"
+        // instead of falling from e.g. 14 GiB directly to 7 GiB on one failed
+        // allocation attempt.
+        for (size_t mib = target_mib; mib >= 256; mib -= 256) {
+            const size_t bytes = mib * MiB;
+            ggml_backend_buffer_t raw = ggml_backend_buft_alloc_buffer(buft, bytes);
+            if (raw == nullptr) {
+                continue;
+            }
+
+            ggml_backend_buffer_set_usage(raw, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            ggml_backend_buffer_clear(raw, 0);
+            moe_expert_vram_cache_buffer.reset(raw);
+
+            st.vram_arena_active = true;
+            st.vram_arena_bytes  = bytes;
+            st.vram_arena_backend = ggml_backend_dev_name(dev);
+
+            LLAMA_LOG_WARN("%s: MoE expert pager reserved %.2f MiB of %s VRAM for the expert-cache arena (auto mode uses all available VRAM after reserve; execution switches to cached GPU tensors after profiling)\n",
+                    __func__, bytes / (1024.0 * 1024.0), st.vram_arena_backend.c_str());
+            return;
+        }
+    }
+
+    LLAMA_LOG_WARN("%s: MoE expert pager could not reserve a GPU VRAM expert-cache arena; CPU-MoE fallback remains active\n", __func__);
+}
+
+
+ggml_tensor * llama_context::moe_expert_gpu_cache_lookup(int il, ggml_tensor * src) const {
+    (void) il;
+    if (src == nullptr || !moe_expert_gpu_cache.active) {
+        return src;
+    }
+
+    auto it = moe_expert_gpu_cache.tensor_map.find(src);
+    if (it == moe_expert_gpu_cache.tensor_map.end() || it->second == nullptr) {
+        return src;
+    }
+
+    return it->second;
+}
+
+void llama_context::moe_expert_gpu_cache_maybe_build() {
+    moe_expert_telemetry_init();
+
+    auto & st = moe_expert_telemetry;
+    auto & gc = moe_expert_gpu_cache;
+
+    if (!st.enabled || !st.auto_profile || gc.attempted || gc.active) {
+        return;
+    }
+
+    if (st.accesses < st.profile_target_accesses) {
+        return;
+    }
+
+    gc.attempted = true;
+
+    constexpr size_t MiB = 1024ull * 1024ull;
+
+    ggml_backend_t gpu_backend = nullptr;
+    ggml_backend_dev_t gpu_dev = nullptr;
+    for (auto & backend : backends) {
+        if (!backend) {
+            continue;
+        }
+        ggml_backend_t be = backend.get();
+        ggml_backend_dev_t dev = ggml_backend_get_device(be);
+        if (dev == nullptr) {
+            continue;
+        }
+        const auto type = ggml_backend_dev_type(dev);
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            gpu_backend = be;
+            gpu_dev = dev;
+            break;
+        }
+    }
+
+    if (gpu_backend == nullptr || gpu_dev == nullptr) {
+        LLAMA_LOG_WARN("%s: MoE expert GPU cache requested but no GPU backend is available; CPU-MoE fallback remains active\n", __func__);
+        return;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(gpu_backend);
+    if (buft == nullptr || ggml_backend_buft_is_host(buft)) {
+        LLAMA_LOG_WARN("%s: MoE expert GPU cache requested but selected backend has no device buffer type; CPU-MoE fallback remains active\n", __func__);
+        return;
+    }
+
+    size_t budget = st.vram_arena_bytes;
+    if (moe_expert_vram_cache_buffer) {
+        moe_expert_vram_cache_buffer.reset();
+        st.vram_arena_active = false;
+    }
+
+    if (budget == 0) {
+        const int32_t req_mib     = std::max<int32_t>(0, llama_env_i32("LLAMA_MOE_EXPERT_CACHE_VRAM_MIB", 0));
+        const int32_t reserve_mib = std::max<int32_t>(0, llama_env_i32("LLAMA_MOE_EXPERT_VRAM_RESERVE_MIB", 512));
+        const int32_t max_mib     = std::max<int32_t>(0, llama_env_i32("LLAMA_MOE_EXPERT_VRAM_MAX_MIB", 0));
+
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        ggml_backend_dev_memory(gpu_dev, &free_bytes, &total_bytes);
+
+        if (req_mib > 0) {
+            budget = (size_t) req_mib * MiB;
+        } else if (free_bytes > ((size_t) reserve_mib + 256) * MiB) {
+            budget = free_bytes - (size_t) reserve_mib * MiB;
+            if (max_mib > 0) {
+                budget = std::min(budget, (size_t) max_mib * MiB);
+            }
+        }
+    }
+
+    if (budget < 256 * MiB) {
+        LLAMA_LOG_WARN("%s: MoE expert GPU cache budget is too small (%.2f MiB); CPU-MoE fallback remains active\n", __func__, budget / (1024.0 * 1024.0));
+        return;
+    }
+
+    std::vector<std::pair<int32_t, uint64_t>> layers;
+    layers.reserve(st.layer_accesses.size());
+    for (const auto & kv : st.layer_accesses) {
+        if (kv.first >= 0 && kv.first < (int32_t) model.layers.size() && kv.second > 0) {
+            layers.emplace_back(kv.first, kv.second);
+        }
+    }
+
+    std::sort(layers.begin(), layers.end(), [](const auto & a, const auto & b) {
+        if (a.second != b.second) {
+            return a.second > b.second;
+        }
+        return a.first < b.first;
+    });
+
+    auto collect_layer_weight_tensors = [this](int32_t il) {
+        std::vector<ggml_tensor *> out;
+        if (il < 0 || il >= (int32_t) model.layers.size()) {
+            return out;
+        }
+        const llama_layer & layer = model.layers[(size_t) il];
+        ggml_tensor * tensors[] = {
+            layer.ffn_gate_exps,
+            layer.ffn_down_exps,
+            layer.ffn_up_exps,
+            layer.ffn_gate_up_exps,
+        };
+        for (ggml_tensor * t : tensors) {
+            if (t != nullptr && t->buffer != nullptr && ggml_nbytes(t) > 0 && t->ne[2] > 0) {
+                out.push_back(t);
+            }
+        }
+        return out;
+    };
+
+    auto collect_layer_all_tensors = [this](int32_t il) {
+        std::vector<ggml_tensor *> out;
+        if (il < 0 || il >= (int32_t) model.layers.size()) {
+            return out;
+        }
+        const llama_layer & layer = model.layers[(size_t) il];
+        ggml_tensor * tensors[] = {
+            layer.ffn_gate_exps,
+            layer.ffn_down_exps,
+            layer.ffn_up_exps,
+            layer.ffn_gate_up_exps,
+            layer.ffn_gate_exps_b,
+            layer.ffn_down_exps_b,
+            layer.ffn_up_exps_b,
+            layer.ffn_gate_up_exps_b,
+            layer.ffn_gate_exps_s,
+            layer.ffn_down_exps_s,
+            layer.ffn_up_exps_s,
+        };
+        for (ggml_tensor * t : tensors) {
+            if (t != nullptr && t->buffer != nullptr && ggml_nbytes(t) > 0) {
+                out.push_back(t);
+            }
+        }
+        return out;
+    };
+
+    const bool hard_backend = llama_env_bool("LLAMA_MOE_EXPERT_HARD_BACKEND", true);
+    const int32_t requested_slots = std::max<int32_t>(1, llama_env_i32("LLAMA_MOE_EXPERT_CACHE_EXPERTS", st.cache_experts > 0 ? st.cache_experts : 64));
+
+    std::vector<ggml_tensor *> selected;
+    std::vector<std::pair<ggml_tensor *, int32_t>> selected_slot_counts;
+    std::set<ggml_tensor *> selected_set;
+    std::set<int32_t> cached_layer_set;
+    size_t selected_bytes = 0;
+
+    if (hard_backend) {
+        // Hard backend v1: create per-expert GPU slot banks for hot layers. The
+        // slot banks do not preserve the original expert axis. Instead, CUDA's
+        // mul_mat_id backend remaps real expert IDs to cache slots and promotes
+        // missing experts from the CPU master tensor on demand.
+        for (const auto & [il, access_count] : layers) {
+            (void) access_count;
+            const auto tensors = collect_layer_weight_tensors(il);
+            if (tensors.empty()) {
+                continue;
+            }
+
+            size_t layer_bytes = 0;
+            std::vector<std::pair<ggml_tensor *, int32_t>> layer_slots;
+            bool duplicate = false;
+            for (ggml_tensor * t : tensors) {
+                if (selected_set.count(t)) {
+                    duplicate = true;
+                    break;
+                }
+                const int32_t n_experts = (int32_t) t->ne[2];
+                const int32_t n_slots = std::min<int32_t>(requested_slots, std::max<int32_t>(1, n_experts));
+                const size_t slot_bytes = (size_t) t->nb[2] * (size_t) n_slots;
+                if (slot_bytes == 0) {
+                    duplicate = true;
+                    break;
+                }
+                layer_bytes += slot_bytes;
+                layer_slots.emplace_back(t, n_slots);
+            }
+            if (duplicate || layer_bytes == 0) {
+                continue;
+            }
+            if (selected_bytes + layer_bytes > budget) {
+                continue;
+            }
+
+            for (const auto & ts : layer_slots) {
+                selected.push_back(ts.first);
+                selected_slot_counts.push_back(ts);
+                selected_set.insert(ts.first);
+            }
+            selected_bytes += layer_bytes;
+            cached_layer_set.insert(il);
+
+            if (budget - selected_bytes < 256 * MiB) {
+                break;
+            }
+        }
+    } else {
+        // Conservative fallback: complete whole-layer tensor copies.
+        for (const auto & [il, access_count] : layers) {
+            (void) access_count;
+            const auto tensors = collect_layer_all_tensors(il);
+            if (tensors.empty()) {
+                continue;
+            }
+
+            size_t layer_bytes = 0;
+            bool duplicate = false;
+            for (ggml_tensor * t : tensors) {
+                if (selected_set.count(t)) {
+                    duplicate = true;
+                    break;
+                }
+                layer_bytes += ggml_nbytes(t);
+            }
+            if (duplicate || layer_bytes == 0) {
+                continue;
+            }
+            if (selected_bytes + layer_bytes > budget) {
+                continue;
+            }
+
+            for (ggml_tensor * t : tensors) {
+                selected.push_back(t);
+                selected_set.insert(t);
+            }
+            selected_bytes += layer_bytes;
+            cached_layer_set.insert(il);
+
+            if (budget - selected_bytes < 256 * MiB) {
+                break;
+            }
+        }
+    }
+
+    if (selected.empty()) {
+        LLAMA_LOG_WARN("%s: MoE expert GPU cache found no expert tensors that fit in %.2f MiB; CPU-MoE fallback remains active\n", __func__, budget / (1024.0 * 1024.0));
+        return;
+    }
+
+    const size_t meta_size = 1024 * 1024 + selected.size() * GGML_TENSOR_SIZE * 8;
+    ggml_init_params ctx_params = {
+        /*.mem_size   =*/ meta_size,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context_ptr ctx { ggml_init(ctx_params) };
+    if (!ctx) {
+        LLAMA_LOG_WARN("%s: failed to create MoE expert GPU cache metadata context; CPU-MoE fallback remains active\n", __func__);
+        return;
+    }
+
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> tensor_map;
+    tensor_map.reserve(selected.size());
+
+    if (hard_backend) {
+        for (const auto & [src, n_slots] : selected_slot_counts) {
+            const int n_dims = ggml_n_dims(src);
+            int64_t ne[GGML_MAX_DIMS] = { src->ne[0], src->ne[1], n_slots, src->ne[3] };
+            ggml_tensor * dst = ggml_new_tensor(ctx.get(), src->type, n_dims, ne);
+            if (dst == nullptr) {
+                LLAMA_LOG_WARN("%s: failed to create MoE slot-cache tensor metadata for %s; CPU-MoE fallback remains active\n", __func__, src->name);
+                return;
+            }
+            ggml_format_name(dst, "%s#moe_slot_cache", src->name);
+            tensor_map.emplace(src, dst);
+        }
+    } else {
+        for (ggml_tensor * src : selected) {
+            const int n_dims = ggml_n_dims(src);
+            int64_t ne[GGML_MAX_DIMS] = { src->ne[0], src->ne[1], src->ne[2], src->ne[3] };
+            ggml_tensor * dst = ggml_new_tensor(ctx.get(), src->type, n_dims, ne);
+            if (dst == nullptr) {
+                LLAMA_LOG_WARN("%s: failed to create MoE cache tensor metadata for %s; CPU-MoE fallback remains active\n", __func__, src->name);
+                return;
+            }
+            ggml_format_name(dst, "%s#moe_gpu_cache", src->name);
+            tensor_map.emplace(src, dst);
+        }
+    }
+
+    ggml_backend_buffer_t raw = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+    if (raw == nullptr) {
+        LLAMA_LOG_WARN("%s: failed to allocate %.2f MiB requested MoE GPU cache tensors on %s; CPU-MoE fallback remains active\n",
+                __func__, selected_bytes / (1024.0 * 1024.0), ggml_backend_dev_name(gpu_dev));
+        return;
+    }
+
+    ggml_backend_buffer_set_usage(raw, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_buffer_ptr buffer { raw };
+
+    size_t copied = 0;
+    std::vector<std::unique_ptr<ggml_moe_expert_slot_cache>> slot_caches;
+
+    if (hard_backend) {
+        slot_caches.reserve(selected_slot_counts.size());
+        for (const auto & [src, n_slots] : selected_slot_counts) {
+            ggml_tensor * dst = tensor_map.at(src);
+
+            auto meta = std::make_unique<ggml_moe_expert_slot_cache>();
+            meta->cpu_tensor = src;
+            meta->n_experts = (int32_t) src->ne[2];
+            meta->n_slots = n_slots;
+            meta->cpu_expert_stride_bytes = src->nb[2];
+            meta->gpu_slot_stride_bytes = dst->nb[2];
+            meta->copy_bytes = std::min(meta->cpu_expert_stride_bytes, meta->gpu_slot_stride_bytes);
+            meta->slot_to_expert.assign((size_t) n_slots, -1);
+            meta->slot_last_access.assign((size_t) n_slots, 0);
+
+            dst->op_params[0] = GGML_MOE_EXPERT_SLOT_CACHE_MAGIC;
+            dst->extra = meta.get();
+            copied += (size_t) dst->nb[2] * (size_t) n_slots;
+            slot_caches.push_back(std::move(meta));
+        }
+    } else {
+        for (ggml_tensor * src : selected) {
+            ggml_tensor * dst = tensor_map.at(src);
+            ggml_backend_tensor_copy(src, dst);
+            copied += ggml_nbytes(src);
+        }
+    }
+
+    gc.ctx = std::move(ctx);
+    gc.buffer = std::move(buffer);
+    gc.tensor_map = std::move(tensor_map);
+    gc.cached_layers.assign(cached_layer_set.begin(), cached_layer_set.end());
+    gc.bytes = copied;
+    gc.backend = ggml_backend_dev_name(gpu_dev);
+    gc.active = true;
+    gc.expert_slot_backend = hard_backend;
+    gc.slots_per_tensor = hard_backend ? requested_slots : 0;
+    gc.slot_tensor_count = hard_backend ? selected_slot_counts.size() : 0;
+    gc.slot_caches = std::move(slot_caches);
+    gc.epoch++;
+
+    st.vram_arena_active = true;
+    st.vram_arena_bytes = copied;
+    st.vram_arena_backend = gc.backend;
+
+    sched_need_reserve = true;
+
+    if (hard_backend) {
+        LLAMA_LOG_WARN("%s: MoE expert hard backend active: allocated %zu per-expert slot tensors across %zu hot layers on %s (%.2f MiB, %d slots/tensor). CUDA mul_mat_id will JIT-promote selected experts from CPU into GPU slots; uncached layers remain CPU-MoE fallback.\n",
+                __func__, gc.slot_tensor_count, gc.cached_layers.size(), gc.backend.c_str(), copied / (1024.0 * 1024.0), gc.slots_per_tensor);
+    } else {
+        LLAMA_LOG_WARN("%s: MoE expert GPU cache active: copied %zu expert tensors across %zu hot layers to %s (%.2f MiB). Existing ggml_mul_mat_id now uses cached GPU tensor copies for complete cached layers; uncached layers remain CPU-MoE fallback.\n",
+                __func__, selected.size(), gc.cached_layers.size(), gc.backend.c_str(), copied / (1024.0 * 1024.0));
+    }
+}
+
+void llama_context::moe_expert_telemetry_init() {
+    if (moe_expert_telemetry.initialized) {
+        return;
+    }
+
+    moe_expert_telemetry.initialized = true;
+    moe_expert_telemetry.enabled = llama_env_bool("LLAMA_MOE_EXPERT_TELEMETRY", false);
+    moe_expert_telemetry.log_enabled = llama_env_bool("LLAMA_MOE_EXPERT_LOG", false);
+    moe_expert_telemetry.trace = llama_env_bool("LLAMA_MOE_EXPERT_TRACE", false);
+    moe_expert_telemetry.auto_profile = llama_env_bool("LLAMA_MOE_EXPERT_AUTO_PROFILE", true);
+    moe_expert_telemetry.cache_experts = std::max<int32_t>(0, llama_env_i32("LLAMA_MOE_EXPERT_CACHE_EXPERTS", 64));
+    moe_expert_telemetry.log_every = std::max<int32_t>(0, llama_env_i32("LLAMA_MOE_EXPERT_LOG_EVERY", 5000));
+    moe_expert_telemetry.profile_target_accesses = std::max<int32_t>(1000, llama_env_i32("LLAMA_MOE_EXPERT_PROFILE_ACCESSES", 50000));
+    moe_expert_telemetry.policy = llama_env_str("LLAMA_MOE_EXPERT_CACHE_POLICY", "lfru");
+
+    auto add_global_sim = [this](int32_t capacity) {
+        moe_expert_cache_sim_state sim;
+        sim.capacity = capacity;
+        sim.per_layer = false;
+        moe_expert_telemetry.global_sims.push_back(std::move(sim));
+    };
+    auto add_per_layer_sim = [this](int32_t capacity) {
+        moe_expert_cache_sim_state sim;
+        sim.capacity = capacity;
+        sim.per_layer = true;
+        moe_expert_telemetry.per_layer_sims.push_back(std::move(sim));
+    };
+
+    // These are simulation candidates only. They do not allocate VRAM. The
+    // physical GPU expert cache still requires backend tensor migration support;
+    // the profiler chooses the plan that such a backend should use.
+    for (int32_t cap : { 64, 128, 256, 512, 1024, 2048, 4096 }) {
+        add_global_sim(cap);
+    }
+    for (int32_t cap : { 1, 2, 4, 8, 16, 32, 64 }) {
+        add_per_layer_sim(cap);
+    }
+
+    if (moe_expert_telemetry.enabled && (moe_expert_telemetry.log_enabled || moe_expert_telemetry.trace)) {
+        LLAMA_LOG_WARN("%s: MoE expert profiler runtime enabled: cache_experts=%d, policy=%s, log_every=%d, auto_profile=%s, target_accesses=%" PRIu64 ". After profiling, the pager will promote complete hot MoE layers into GPU VRAM using all available auto-sized VRAM; uncached layers remain CPU-MoE fallback.\n",
+                __func__, moe_expert_telemetry.cache_experts, moe_expert_telemetry.policy.c_str(), moe_expert_telemetry.log_every,
+                moe_expert_telemetry.auto_profile ? "true" : "false", moe_expert_telemetry.profile_target_accesses);
+    }
+}
+
+void llama_context::moe_expert_telemetry_print(bool final) const {
+    if (!moe_expert_telemetry.initialized || !moe_expert_telemetry.enabled) {
+        return;
+    }
+
+    // Normal pager mode self-profiles silently. Summaries are user-facing only
+    // with --moe-expert-log or developer-facing with --moe-expert-trace. Still
+    // allow final warnings below in trace/log mode.
+    if (!moe_expert_telemetry.log_enabled && !moe_expert_telemetry.trace) {
+        return;
+    }
+
+    const double hit_rate = moe_expert_telemetry.accesses == 0 ? 0.0 :
+        100.0 * (double) moe_expert_telemetry.hits / (double) moe_expert_telemetry.accesses;
+
+    auto sim_rate = [](const moe_expert_cache_sim_state & sim) -> double {
+        return sim.accesses == 0 ? 0.0 : 100.0 * (double) sim.hits / (double) sim.accesses;
+    };
+
+    const moe_expert_cache_sim_state * best_global = nullptr;
+    const moe_expert_cache_sim_state * best_per_layer = nullptr;
+    for (const auto & sim : moe_expert_telemetry.global_sims) {
+        if (best_global == nullptr || sim_rate(sim) > sim_rate(*best_global)) {
+            best_global = &sim;
+        }
+    }
+    for (const auto & sim : moe_expert_telemetry.per_layer_sims) {
+        if (best_per_layer == nullptr || sim_rate(sim) > sim_rate(*best_per_layer)) {
+            best_per_layer = &sim;
+        }
+    }
+
+    const int32_t best_global_cap = best_global ? best_global->capacity : 0;
+    const double best_global_rate = best_global ? sim_rate(*best_global) : 0.0;
+    const int32_t best_layer_cap = best_per_layer ? best_per_layer->capacity : 0;
+    const double best_layer_rate = best_per_layer ? sim_rate(*best_per_layer) : 0.0;
+
+    const bool ready = moe_expert_telemetry.accesses >= moe_expert_telemetry.profile_target_accesses;
+
+    const char * backend_status = moe_expert_gpu_cache.active ?
+        (moe_expert_gpu_cache.expert_slot_backend ? "gpu-expert-slot-cache-active(jit-promote-cpu-to-gpu)" : "gpu-whole-layer-cache-active(cpu-moe-fallback-for-uncached)") :
+        (moe_expert_telemetry.vram_arena_active ? "gpu-cache-arena-reserved(cpu-moe-fallback)" : "gpu-cache-not-active(cpu-moe-fallback)");
+
+    LLAMA_LOG_WARN("%s: MoE expert profiler%s: ready=%s, decode_calls=%" PRIu64 ", accesses=%" PRIu64 ", prompt_accesses=%" PRIu64 ", decode_accesses=%" PRIu64 ", selected_cache=%zu/%d, selected_hit_rate=%.2f%%, best_global=%d@%.2f%%, best_per_layer=%d/layer@%.2f%%, score_ids=%" PRIu64 ", ids_valid=%" PRIu64 ", ids_invalid=%" PRIu64 ", policy=%s, vram_cache=%.2fMiB/%s, cached_tensors=%zu, cached_layers=%zu, backend=%s\n",
+            __func__, final ? " final" : "",
+            ready ? "true" : "false",
+            moe_expert_telemetry.decode_calls,
+            moe_expert_telemetry.accesses,
+            moe_expert_telemetry.prompt_accesses,
+            moe_expert_telemetry.decode_accesses,
+            moe_expert_telemetry.cache.size(), moe_expert_telemetry.cache_experts,
+            hit_rate,
+            best_global_cap, best_global_rate,
+            best_layer_cap, best_layer_rate,
+            moe_expert_telemetry.score_ids_derived,
+            moe_expert_telemetry.ids_valid, moe_expert_telemetry.ids_invalid,
+            moe_expert_telemetry.policy.c_str(),
+            moe_expert_telemetry.vram_arena_bytes / (1024.0 * 1024.0),
+            moe_expert_telemetry.vram_arena_backend.empty() ? "none" : moe_expert_telemetry.vram_arena_backend.c_str(),
+            moe_expert_gpu_cache.expert_slot_backend ? moe_expert_gpu_cache.slot_tensor_count : moe_expert_gpu_cache.tensor_map.size(),
+            moe_expert_gpu_cache.cached_layers.size(),
+            backend_status);
+
+    if (moe_expert_telemetry.trace) {
+        LLAMA_LOG_WARN("%s: MoE expert profiler debug%s: record_calls=%" PRIu64 ", ubatches=%" PRIu64 ", batches=%" PRIu64 ", hits=%" PRIu64 ", misses=%" PRIu64 ", score_tensors=%" PRIu64 ", score_f32=%" PRIu64 ", score_rows=%" PRIu64 ", tensors_seen=%" PRIu64 ", tensors_i32=%" PRIu64 ", empty_lists=%" PRIu64 ", no_backend=%" PRIu64 ", bad_type=%" PRIu64 ", zero_ids=%" PRIu64 ", ids_read=%" PRIu64 ", ids_local=%" PRIu64 ", ids_global=%" PRIu64 ", ids_global_rejected=%" PRIu64 ", ids_strided_rows=%" PRIu64 ", last_decode_tokens=%" PRIu64 ", last_decode_outputs=%" PRIu64 ", vram_arena=%.2fMiB/%s\n",
+                __func__, final ? " final" : "",
+                moe_expert_telemetry.record_calls,
+                moe_expert_telemetry.ubatches,
+                moe_expert_telemetry.batches,
+                moe_expert_telemetry.hits,
+                moe_expert_telemetry.misses,
+                moe_expert_telemetry.score_tensors_seen, moe_expert_telemetry.score_tensors_f32,
+                moe_expert_telemetry.score_rows_read,
+                moe_expert_telemetry.tensors_seen, moe_expert_telemetry.tensors_i32,
+                moe_expert_telemetry.tensor_lists_empty, moe_expert_telemetry.tensors_no_backend,
+                moe_expert_telemetry.tensors_bad_type, moe_expert_telemetry.tensors_zero_ids,
+                moe_expert_telemetry.ids_read,
+                moe_expert_telemetry.ids_local, moe_expert_telemetry.ids_global,
+                moe_expert_telemetry.ids_global_rejected, moe_expert_telemetry.ids_strided_rows,
+                moe_expert_telemetry.decode_tokens_last, moe_expert_telemetry.decode_outputs_last,
+                moe_expert_telemetry.vram_arena_bytes / (1024.0 * 1024.0),
+                moe_expert_telemetry.vram_arena_backend.empty() ? "none" : moe_expert_telemetry.vram_arena_backend.c_str());
+    }
+
+    if (final && moe_expert_telemetry.decode_calls > 0 && moe_expert_telemetry.record_calls == 0) {
+        LLAMA_LOG_WARN("%s: MoE expert profiler final: decode ran, but moe_expert_telemetry_record() was never called. The telemetry call site is not on this execution path.\n", __func__);
+    } else if (final && moe_expert_telemetry.ubatches > 0 && moe_expert_telemetry.tensors_seen == 0 && moe_expert_telemetry.score_tensors_seen == 0) {
+        LLAMA_LOG_WARN("%s: MoE expert profiler final: no MoE routing tensors were captured. The model may use a different MoE path, or this binary was not built from the profiler source.\n", __func__);
+    } else if (final && (moe_expert_telemetry.tensors_seen > 0 || moe_expert_telemetry.score_tensors_seen > 0) && moe_expert_telemetry.accesses == 0) {
+        LLAMA_LOG_WARN("%s: MoE expert profiler final: MoE routing tensors were captured but no valid expert IDs were derived. Check tensor type/backend diagnostics above.\n", __func__);
+    }
+}
+
+void llama_context::moe_expert_telemetry_record(const llm_graph_result * res) {
+    moe_expert_telemetry_init();
+
+    if (!moe_expert_telemetry.enabled || res == nullptr) {
+        return;
+    }
+
+    auto & st = moe_expert_telemetry;
+    st.record_calls++;
+    st.ubatches++;
+
+    const auto & selected_tensors = res->get_moe_selected_experts();
+    if (selected_tensors.empty()) {
+        st.tensor_lists_empty++;
+        if (st.log_every > 0 && st.ubatches >= st.last_log_at + (uint64_t) st.log_every) {
+            st.last_log_at = st.ubatches;
+            moe_expert_telemetry_print(false);
+        }
+        return;
+    }
+
+    st.batches++;
+
+
+    auto touch_cache = [&st](std::unordered_map<uint64_t, moe_expert_cache_entry> & cache, int32_t capacity, uint64_t key) -> bool {
+        auto it = cache.find(key);
+        if (it != cache.end()) {
+            it->second.last_access = st.last_access;
+            it->second.frequency++;
+            return true;
+        }
+
+        if (capacity <= 0) {
+            return false;
+        }
+
+        if ((int32_t) cache.size() >= capacity) {
+            auto victim = cache.begin();
+            for (auto cur = cache.begin(); cur != cache.end(); ++cur) {
+                bool take = false;
+                if (st.policy == "lru") {
+                    take = cur->second.last_access < victim->second.last_access;
+                } else if (st.policy == "lfu") {
+                    take = cur->second.frequency < victim->second.frequency ||
+                        (cur->second.frequency == victim->second.frequency && cur->second.last_access < victim->second.last_access);
+                } else { // lfru: LFU tie-broken by recency
+                    take = cur->second.frequency < victim->second.frequency ||
+                        (cur->second.frequency == victim->second.frequency && cur->second.last_access < victim->second.last_access);
+                }
+
+                if (take) {
+                    victim = cur;
+                }
+            }
+            cache.erase(victim);
+        }
+
+        cache.emplace(key, moe_expert_cache_entry{ st.last_access, 1 });
+        return false;
+    };
+
+    auto touch_sim = [&st](moe_expert_cache_sim_state & sim, uint64_t key) {
+        sim.accesses++;
+        sim.last_access++;
+
+        auto it = sim.cache.find(key);
+        if (it != sim.cache.end()) {
+            sim.hits++;
+            it->second.last_access = sim.last_access;
+            it->second.frequency++;
+            return;
+        }
+
+        sim.misses++;
+        if (sim.capacity <= 0) {
+            return;
+        }
+
+        const uint32_t layer = (uint32_t) (key >> 32);
+        int32_t current_layer_entries = 0;
+        if (sim.per_layer) {
+            for (const auto & kv : sim.cache) {
+                if ((uint32_t) (kv.first >> 32) == layer) {
+                    current_layer_entries++;
+                }
+            }
+        }
+
+        const bool full = sim.per_layer ? current_layer_entries >= sim.capacity : (int32_t) sim.cache.size() >= sim.capacity;
+        if (full && !sim.cache.empty()) {
+            auto victim = sim.cache.end();
+            for (auto cur = sim.cache.begin(); cur != sim.cache.end(); ++cur) {
+                if (sim.per_layer && (uint32_t) (cur->first >> 32) != layer) {
+                    continue;
+                }
+                if (victim == sim.cache.end()) {
+                    victim = cur;
+                    continue;
+                }
+
+                bool take = false;
+                if (st.policy == "lru") {
+                    take = cur->second.last_access < victim->second.last_access;
+                } else {
+                    take = cur->second.frequency < victim->second.frequency ||
+                        (cur->second.frequency == victim->second.frequency && cur->second.last_access < victim->second.last_access);
+                }
+                if (take) {
+                    victim = cur;
+                }
+            }
+            if (victim != sim.cache.end()) {
+                sim.cache.erase(victim);
+            }
+        }
+
+        sim.cache.emplace(key, moe_expert_cache_entry{ sim.last_access, 1 });
+    };
+
+    auto touch = [&st, &touch_cache, &touch_sim](uint64_t key) {
+        st.accesses++;
+        st.last_access++;
+        if (st.decode_outputs_last > 0) {
+            st.decode_accesses++;
+        } else {
+            st.prompt_accesses++;
+        }
+
+        if (touch_cache(st.cache, st.cache_experts, key)) {
+            st.hits++;
+        } else {
+            st.misses++;
+        }
+
+        if (st.auto_profile) {
+            for (auto & sim : st.global_sims) {
+                touch_sim(sim, key);
+            }
+            for (auto & sim : st.per_layer_sims) {
+                touch_sim(sim, key);
+            }
+        }
+    };
+
+    auto consume_expert_id = [&st, &touch](const llm_graph_result::moe_selected_experts_tensor & t_info, int64_t local_id_space, int64_t global_id_space, int32_t expert) {
+        st.ids_read++;
+
+        if (expert < 0) {
+            st.ids_invalid++;
+            return;
+        }
+
+        uint64_t key = 0;
+        if ((int64_t) expert < local_id_space) {
+            // Normal path: expert IDs are layer-local. Include the layer in the
+            // cache key because expert 7 in layer 3 is a different tensor from
+            // expert 7 in layer 20.
+            st.ids_local++;
+            key = ((uint64_t) (uint32_t) t_info.il << 32) | (uint32_t) expert;
+        } else if ((int64_t) expert < global_id_space) {
+            st.ids_global++;
+            key = (uint64_t) (uint32_t) expert;
+        } else {
+            st.ids_invalid++;
+            st.ids_global_rejected++;
+            return;
+        }
+
+        st.ids_valid++;
+        st.layer_accesses[(int32_t) t_info.il]++;
+        touch(key);
+    };
+
+    auto process_score_tensor = [&](const llm_graph_result::moe_selected_experts_tensor & t_info) -> bool {
+        ggml_tensor * scores = t_info.t_scores;
+        if (scores == nullptr) {
+            return false;
+        }
+
+        st.score_tensors_seen++;
+
+        if (scores->type != GGML_TYPE_F32) {
+            st.tensors_bad_type++;
+            return false;
+        }
+
+        st.score_tensors_f32++;
+
+        if (ggml_backend_sched_get_tensor_backend(sched.get(), scores) == nullptr) {
+            st.tensors_no_backend++;
+            return false;
+        }
+
+        const int64_t n_expert = scores->ne[0];
+        const int64_t n1 = scores->ne[1];
+        const int64_t n2 = scores->ne[2];
+        const int64_t n3 = scores->ne[3];
+        const int64_t k = std::min<int64_t>(std::max<int64_t>(1, t_info.n_expert_used), n_expert);
+
+        if (n_expert <= 0 || k <= 0) {
+            st.tensors_zero_ids++;
+            return false;
+        }
+
+        st.tmp_scores.resize((size_t) n_expert);
+        st.tmp_top_ids.resize((size_t) k);
+        st.tmp_top_vals.resize((size_t) k);
+
+        const int64_t local_id_space = std::max<int64_t>(1, t_info.n_expert);
+        const int64_t global_id_space = local_id_space * std::max<int64_t>(1, (int64_t) selected_tensors.size());
+
+        for (int64_t i3 = 0; i3 < n3; ++i3) {
+            for (int64_t i2 = 0; i2 < n2; ++i2) {
+                for (int64_t i1 = 0; i1 < n1; ++i1) {
+                    if (scores->nb[0] == (int64_t) sizeof(float)) {
+                        const size_t offs = (size_t) (i1 * scores->nb[1] + i2 * scores->nb[2] + i3 * scores->nb[3]);
+                        ggml_backend_tensor_get(scores, st.tmp_scores.data(), offs, (size_t) n_expert * sizeof(float));
+                    } else {
+                        for (int64_t i0 = 0; i0 < n_expert; ++i0) {
+                            float v = -INFINITY;
+                            const size_t offs = (size_t) (i0 * scores->nb[0] + i1 * scores->nb[1] + i2 * scores->nb[2] + i3 * scores->nb[3]);
+                            ggml_backend_tensor_get(scores, &v, offs, sizeof(v));
+                            st.tmp_scores[(size_t) i0] = v;
+                        }
+                    }
+
+                    std::fill(st.tmp_top_ids.begin(), st.tmp_top_ids.end(), -1);
+                    std::fill(st.tmp_top_vals.begin(), st.tmp_top_vals.end(), -INFINITY);
+
+                    for (int64_t expert = 0; expert < n_expert; ++expert) {
+                        float v = st.tmp_scores[(size_t) expert];
+                        // CUDA top-k MoE sanitizes NaN to -FLT_MAX before top-k.
+                        // Mirror that behavior so telemetry derives the same IDs.
+                        if (std::isnan(v)) {
+                            v = -FLT_MAX;
+                        }
+
+                        for (int64_t pos = 0; pos < k; ++pos) {
+                            const int32_t cur_id = st.tmp_top_ids[(size_t) pos];
+                            const float cur_v = st.tmp_top_vals[(size_t) pos];
+                            if (cur_id < 0 || v > cur_v || (v == cur_v && expert < cur_id)) {
+                                for (int64_t shift = k - 1; shift > pos; --shift) {
+                                    st.tmp_top_vals[(size_t) shift] = st.tmp_top_vals[(size_t) (shift - 1)];
+                                    st.tmp_top_ids[(size_t) shift]  = st.tmp_top_ids[(size_t) (shift - 1)];
+                                }
+                                st.tmp_top_vals[(size_t) pos] = v;
+                                st.tmp_top_ids[(size_t) pos]  = (int32_t) expert;
+                                break;
+                            }
+                        }
+                    }
+
+                    st.score_rows_read++;
+                    for (int64_t pos = 0; pos < k; ++pos) {
+                        const int32_t expert = st.tmp_top_ids[(size_t) pos];
+                        if (expert >= 0) {
+                            st.score_ids_derived++;
+                            consume_expert_id(t_info, local_id_space, global_id_space, expert);
+                        }
+                    }
+                }
+            }
+        }
+
+        return true;
+    };
+
+    auto process_id_tensor_fallback = [&](const llm_graph_result::moe_selected_experts_tensor & t_info) {
+        ggml_tensor * t = t_info.t_selected;
+        st.tensors_seen++;
+
+        if (t == nullptr) {
+            st.tensors_bad_type++;
+            return;
+        }
+
+        if (t->type != GGML_TYPE_I32) {
+            st.tensors_bad_type++;
+            return;
+        }
+
+        st.tensors_i32++;
+
+        const int64_t n_ids = ggml_nelements(t);
+        if (n_ids <= 0) {
+            st.tensors_zero_ids++;
+            return;
+        }
+
+        if (ggml_backend_sched_get_tensor_backend(sched.get(), t) == nullptr) {
+            st.tensors_no_backend++;
+            return;
+        }
+
+        const int64_t ne0 = t->ne[0];
+        const int64_t ne1 = t->ne[1];
+        const int64_t ne2 = t->ne[2];
+        const int64_t ne3 = t->ne[3];
+
+        const int64_t local_id_space = std::max<int64_t>(1, t_info.n_expert);
+        const int64_t global_id_space = local_id_space * std::max<int64_t>(1, (int64_t) selected_tensors.size());
+
+        if (t->nb[0] == (int64_t) sizeof(int32_t)) {
+            st.tmp_ids.resize((size_t) ne0);
+            for (int64_t i3 = 0; i3 < ne3; ++i3) {
+                for (int64_t i2 = 0; i2 < ne2; ++i2) {
+                    for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                        const size_t offs = (size_t) (i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3]);
+                        ggml_backend_tensor_get(t, st.tmp_ids.data(), offs, (size_t) ne0 * sizeof(int32_t));
+                        st.ids_strided_rows++;
+                        for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                            consume_expert_id(t_info, local_id_space, global_id_space, st.tmp_ids[(size_t) i0]);
+                        }
+                    }
+                }
+            }
+        } else {
+            for (int64_t i3 = 0; i3 < ne3; ++i3) {
+                for (int64_t i2 = 0; i2 < ne2; ++i2) {
+                    for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                        for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                            int32_t expert = -1;
+                            const size_t offs = (size_t) (i0 * t->nb[0] + i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3]);
+                            ggml_backend_tensor_get(t, &expert, offs, sizeof(expert));
+                            consume_expert_id(t_info, local_id_space, global_id_space, expert);
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    for (const auto & t_info : selected_tensors) {
+        // Prefer score-derived top-k. This reads the exact final routing score
+        // tensor used by ggml_argsort_top_k(), so it avoids CUDA fusion/view
+        // artifacts where the selected ID tensor contains sparse rows or stale
+        // full-argsort storage. The ID tensor remains as a fallback and a future
+        // debug source.
+        if (!process_score_tensor(t_info)) {
+            process_id_tensor_fallback(t_info);
+        }
+    }
+
+    // Print at most one compact summary per configured access interval. Use
+    // accesses rather than ubatches so token-by-token decode does not spam when
+    // no new valid expert IDs were observed.
+    if (st.log_every > 0 && st.accesses >= st.last_log_at + (uint64_t) st.log_every) {
+        st.last_log_at = st.accesses;
+        moe_expert_telemetry_print(false);
+    }
+
+    moe_expert_gpu_cache_maybe_build();
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
@@ -1736,6 +2742,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
+    if (moe_expert_telemetry.enabled) {
+        // Keep this counter hot, but leave decode-level logging quiet. The
+        // telemetry summary below is driven by expert accesses, not decode calls.
+        moe_expert_telemetry.decode_calls++;
+        moe_expert_telemetry.decode_tokens_last = n_tokens_all;
+        moe_expert_telemetry.decode_outputs_last = n_outputs_all;
+    }
+
     if (output_all) {
         // require that all tokens are output
         if (n_outputs_all != n_tokens_all) {
@@ -2051,6 +3065,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    // Do not print a summary on every decode return: llama-server typically
+    // decodes one token per call, so that becomes massive log spam. Summaries
+    // are emitted from moe_expert_telemetry_record() when enough valid expert
+    // accesses have accumulated.
 
     return 0;
 }
@@ -2414,6 +3433,8 @@ llm_graph_params llama_context::graph_params(
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
+        /*.moe_expert_cache_lookup =*/ [this](int il, ggml_tensor * src) { return this->moe_expert_gpu_cache_lookup(il, src); },
+        /*.moe_expert_cache_epoch  =*/ moe_expert_gpu_cache.epoch,
         /*.res         =*/ res,
     };
 }
