@@ -927,6 +927,65 @@ static utf8_argv make_utf8_argv() {
 }
 #endif
 
+
+static void common_moe_expert_pager_apply_auto_tune(common_params & params, llama_example ex) {
+    if (!params.moe_expert_pager.enabled || !params.moe_expert_pager.auto_tune) {
+        return;
+    }
+
+    // This auto-tune block deliberately applies only conservative defaults that
+    // are known to be safe for the current CPU-MoE pager stage. These settings
+    // came from the measured single-user 120B MoE run:
+    //   - one server slot avoids multiplying KV/cache memory by the auto slot count
+    //   - no mmap avoids slow page-fault behavior with CPU tensor overrides
+    //   - no prompt RAM cache / checkpoints avoids extra host memory pressure
+    //   - q8 KV and Flash Attention reduce memory pressure and speed decode
+    // Users can disable this with --moe-expert-pager-no-auto-tune.
+
+    if (ex == LLAMA_EXAMPLE_SERVER && params.n_parallel == -1) {
+        params.n_parallel = 1;
+    }
+
+    if (params.use_mmap) {
+        params.use_mmap = false;
+    }
+
+    if (params.cache_ram_mib == 8192) {
+        params.cache_ram_mib = 0;
+    }
+
+    if (params.n_ctx_checkpoints == 32) {
+        params.n_ctx_checkpoints = 0;
+    }
+
+    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
+
+    if (params.cache_type_k == GGML_TYPE_F16) {
+        params.cache_type_k = GGML_TYPE_Q8_0;
+    }
+
+    if (params.cache_type_v == GGML_TYPE_F16) {
+        params.cache_type_v = GGML_TYPE_Q8_0;
+    }
+
+    if (params.moe_expert_pager.cache_experts == 0) {
+        params.moe_expert_pager.cache_experts = 64;
+    }
+
+    if (params.moe_expert_pager.prefetch == 0) {
+        params.moe_expert_pager.prefetch = 8;
+    }
+
+    if ((params.moe_expert_pager.log || params.moe_expert_pager.trace) && params.moe_expert_pager.log_every == 0) {
+        // Human-facing logging should be useful, not per-token spam. 5000
+        // valid expert accesses gives a compact rolling summary on large MoE
+        // generations while still catching early profiler decisions.
+        params.moe_expert_pager.log_every = 5000;
+    }
+}
+
 bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
 #ifdef _WIN32
     auto utf8 = make_utf8_argv();
@@ -955,6 +1014,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             common_params_print_completion(ctx_arg);
             exit(0);
         }
+        common_moe_expert_pager_apply_auto_tune(ctx_arg.params, ex);
         params.lr.init();
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
@@ -2353,6 +2413,123 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-expert-pager"},
+        "enable the experimental MoE expert-pager control plane; also keeps routed MoE tensors in CPU memory via the existing --cpu-moe override",
+        [](common_params & params) {
+            params.moe_expert_pager.enabled = true;
+            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_PAGER"));
+    add_opt(common_arg(
+        {"--moe-expert-pager-no-auto-tune"},
+        "disable MoE expert-pager auto tuning; by default pager mode applies the single-user low-RAM/high-throughput defaults observed to work best",
+        [](common_params & params) {
+            params.moe_expert_pager.auto_tune = false;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_PAGER_NO_AUTO_TUNE"));
+    add_opt(common_arg(
+        {"--moe-expert-whole-layer-cache"},
+        "experimental MoE pager: disable the dynamic per-expert CUDA slot backend and use conservative whole-layer GPU tensor promotion instead",
+        [](common_params & params) {
+            params.moe_expert_pager.hard_backend = false;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_WHOLE_LAYER_CACHE"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-experts"}, "N",
+        "experimental MoE pager: target number of hot experts / GPU slots per cached expert tensor (default auto: 64)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_expert_pager.cache_experts = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_EXPERTS"));
+    add_opt(common_arg(
+        {"--moe-expert-prefetch"}, "N",
+        "experimental MoE pager: target number of likely experts to prefetch per step/layer in a future backend implementation (control-plane only)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_expert_pager.prefetch = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_PREFETCH"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-policy"}, "POLICY",
+        "experimental MoE pager cache policy hint: lru, lfu, or lfru (default: lfru; control-plane only)",
+        [](common_params & params, const std::string & value) {
+            if (value != "lru" && value != "lfu" && value != "lfru") {
+                throw std::invalid_argument("invalid value: expected lru, lfu, or lfru");
+            }
+            params.moe_expert_pager.policy = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_POLICY"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-vram-mib"}, "N",
+        "experimental MoE pager: use N MiB of GPU VRAM for the expert cache; 0 = auto-use all available VRAM after reserve",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_expert_pager.cache_vram_mib = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_VRAM_MIB"));
+    add_opt(common_arg(
+        {"--moe-expert-vram-reserve-mib"}, "N",
+        "experimental MoE pager: keep at least N MiB of VRAM free when auto-sizing the expert cache (default: 512)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_expert_pager.vram_reserve_mib = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_VRAM_RESERVE_MIB"));
+    add_opt(common_arg(
+        {"--moe-expert-vram-max-mib"}, "N",
+        "experimental MoE pager: cap auto-sized expert cache at N MiB; 0 = no cap / use all available after reserve",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_expert_pager.vram_max_mib = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_VRAM_MAX_MIB"));
+    add_opt(common_arg(
+        {"--moe-expert-log"},
+        "experimental MoE pager: print useful auto-profiler/cache summaries only when new information is ready",
+        [](common_params & params) {
+            params.moe_expert_pager.log = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_LOG"));
+    add_opt(common_arg(
+        {"--moe-expert-trace"},
+        "experimental MoE pager: enable developer route/cache diagnostics; implies --moe-expert-log",
+        [](common_params & params) {
+            params.moe_expert_pager.trace = true;
+            params.moe_expert_pager.log = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_TRACE"));
+    add_opt(common_arg(
+        {"--moe-expert-log-every"}, "N",
+        "experimental MoE pager: log useful profiler/cache summaries every N valid expert accesses; implies --moe-expert-log",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_expert_pager.log_every = value;
+            if (value > 0) {
+                params.moe_expert_pager.log = true;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_LOG_EVERY"));
+    add_opt(common_arg(
+        {"--moe-expert-pinned-cpu"},
+        "experimental MoE pager: request pinned/page-locked CPU expert storage in a future backend implementation (control-plane only)",
+        [](common_params & params) {
+            params.moe_expert_pager.pinned_cpu = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_PINNED_CPU"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

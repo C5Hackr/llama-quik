@@ -463,6 +463,26 @@ struct common_params {
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
 
+    // Experimental MoE expert pager control plane. This currently wires CLI/env
+    // controls and forces routed expert tensors into system memory via the
+    // existing CPU-MoE tensor override. The physical persistent GPU expert cache
+    // is intentionally implemented below this layer, inside GGML/CUDA kernels.
+    struct common_moe_expert_pager_params {
+        bool        enabled       = false;
+        bool        auto_tune     = true;  // apply the safe single-user CPU-MoE tuning discovered for pager mode
+        bool        log           = false;  // user-facing useful MoE pager summaries
+        bool        trace         = false;  // developer/debug counters
+        bool        pinned_cpu       = false;
+        bool        hard_backend     = true;    // dynamic per-expert CUDA slot cache; false = conservative whole-layer cache
+        int32_t     cache_experts    = 0;
+        int32_t     prefetch         = 0;
+        int32_t     log_every        = 0;
+        int32_t     cache_vram_mib   = 0;     // 0 = auto-size from free GPU memory
+        int32_t     vram_reserve_mib = 512;   // keep this much VRAM free for runtime/OS when auto-sizing
+        int32_t     vram_max_mib     = 0;     // 0 = no cap; auto mode consumes all available VRAM after reserve
+        std::string policy           = "lfru";
+    } moe_expert_pager;
+
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
 
@@ -609,7 +629,7 @@ struct common_params {
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
-    int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    int32_t checkpoint_min_step = 256;   // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
     std::string hostname      = "127.0.0.1";

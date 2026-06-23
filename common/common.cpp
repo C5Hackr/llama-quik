@@ -16,6 +16,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -1178,6 +1179,15 @@ static void common_init_sampler_from_model(
     get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA),    sparams.mirostat_eta,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
 }
 
+
+static void common_set_env_var(const char * name, const std::string & value) {
+#if defined(_WIN32)
+    _putenv_s(name, value.c_str());
+#else
+    setenv(name, value.c_str(), 1);
+#endif
+}
+
 struct common_init_result::impl {
     impl() = default;
     ~impl() = default;
@@ -1197,6 +1207,56 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
+
+    if (params.moe_expert_pager.enabled) {
+        LOG_WRN("%s: experimental MoE expert pager enabled: routed expert tensors start in CPU memory; after profiling the hard backend JIT-promotes selected experts into GPU slots by default; auto-tuned server defaults are active unless disabled\n", __func__);
+        LOG_WRN("%s: moe pager config: cache_experts=%d, prefetch=%d, policy=%s, log=%s, trace=%s, log_every=%d, pinned_cpu=%s, hard_backend=%s, auto_tune=%s, cache_vram_mib=%d, vram_reserve_mib=%d, vram_max_mib=%d\n",
+                __func__,
+                params.moe_expert_pager.cache_experts,
+                params.moe_expert_pager.prefetch,
+                params.moe_expert_pager.policy.c_str(),
+                params.moe_expert_pager.log ? "true" : "false",
+                params.moe_expert_pager.trace ? "true" : "false",
+                params.moe_expert_pager.log_every,
+                params.moe_expert_pager.pinned_cpu ? "true" : "false",
+                params.moe_expert_pager.hard_backend ? "true" : "false",
+                params.moe_expert_pager.auto_tune ? "true" : "false",
+                params.moe_expert_pager.cache_vram_mib,
+                params.moe_expert_pager.vram_reserve_mib,
+                params.moe_expert_pager.vram_max_mib);
+        LOG_WRN("%s: moe pager effective defaults: mmap=%s, cache_ram_mib=%d, ctx_checkpoints=%d, flash_attn=%s, cache_k=%s, cache_v=%s, n_parallel=%d\n",
+                __func__,
+                params.use_mmap ? "on" : "off",
+                params.cache_ram_mib,
+                params.n_ctx_checkpoints,
+                llama_flash_attn_type_name(params.flash_attn_type),
+                ggml_type_name(params.cache_type_k),
+                ggml_type_name(params.cache_type_v),
+                params.n_parallel);
+
+        // The runtime profiler is enabled for pager mode so it can self-profile
+        // silently even without user-facing logs. --moe-expert-log controls
+        // whether summaries are printed; --moe-expert-trace enables developer
+        // diagnostics.
+        common_set_env_var("LLAMA_MOE_EXPERT_TELEMETRY", "1");
+        common_set_env_var("LLAMA_MOE_EXPERT_LOG", params.moe_expert_pager.log ? "1" : "0");
+        common_set_env_var("LLAMA_MOE_EXPERT_TRACE", params.moe_expert_pager.trace ? "1" : "0");
+        common_set_env_var("LLAMA_MOE_EXPERT_AUTO_PROFILE", params.moe_expert_pager.auto_tune ? "1" : "0");
+        common_set_env_var("LLAMA_MOE_EXPERT_HARD_BACKEND", params.moe_expert_pager.hard_backend ? "1" : "0");
+        if (params.moe_expert_pager.log || params.moe_expert_pager.trace) {
+            LOG_WRN("%s: moe pager telemetry requested: summaries=%s, trace=%s, env LLAMA_MOE_EXPERT_TELEMETRY=1\n",
+                    __func__,
+                    params.moe_expert_pager.log ? "on" : "off",
+                    params.moe_expert_pager.trace ? "on" : "off");
+        }
+        common_set_env_var("LLAMA_MOE_EXPERT_CACHE_EXPERTS", std::to_string(params.moe_expert_pager.cache_experts));
+        common_set_env_var("LLAMA_MOE_EXPERT_PREFETCH", std::to_string(params.moe_expert_pager.prefetch));
+        common_set_env_var("LLAMA_MOE_EXPERT_CACHE_POLICY", params.moe_expert_pager.policy);
+        common_set_env_var("LLAMA_MOE_EXPERT_LOG_EVERY", std::to_string(params.moe_expert_pager.log_every));
+        common_set_env_var("LLAMA_MOE_EXPERT_CACHE_VRAM_MIB", std::to_string(params.moe_expert_pager.cache_vram_mib));
+        common_set_env_var("LLAMA_MOE_EXPERT_VRAM_RESERVE_MIB", std::to_string(params.moe_expert_pager.vram_reserve_mib));
+        common_set_env_var("LLAMA_MOE_EXPERT_VRAM_MAX_MIB", std::to_string(params.moe_expert_pager.vram_max_mib));
+    }
 
     if (params.fit_params) {
         LOG_INF("%s: fitting params to device memory ...\n", __func__);
